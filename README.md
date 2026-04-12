@@ -1,4 +1,4 @@
-# Latent Visual Reasoning
+# Latent Visual 
 
 This repository contains a script for training [Latent Visual Reasoning](https://www.arxiv.org/abs/2509.24251) based on [Qwen2.5-VL](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct).
 
