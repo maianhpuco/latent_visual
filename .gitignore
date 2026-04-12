@@ -1,0 +1,37 @@
+# ── Model checkpoints (large binary files, multi-GB) ────────────────────────
+checkpoints/
+checkpoints_rerun/
+
+# ── Training & eval logs ────────────────────────────────────────────────────
+logs/
+eval_results/
+*.log
+wandb/
+
+# ── Claude / Codex internal state ────────────────────────────────────────────
+.claude/
+.codex
+
+# ── Legacy / read-only reference directories ─────────────────────────────────
+src_old/
+scripts_old/
+evaluation_old/
+
+# ── Python artifacts ─────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# ── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Temp / scratch files ─────────────────────────────────────────────────────
+inference copy.py
+*.tmp
+*.swp
+*.swo

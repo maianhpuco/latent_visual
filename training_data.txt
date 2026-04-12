@@ -1,0 +1,21 @@
+1. virl39k.json
+
+Images from the ViRL39K dataset
+Source: Hugging Face — MMInstruction/ViRL39K
+
+2. viscot_363k_lvr_formatted.json
+
+Images from VisCOT dataset
+Source: Hugging Face — Xkev/Llama-3.2V-11B-cot or the original VisCOT repo
+
+3. viscot_sroie_dude_lvr_formatted.json
+
+Images from SROIE (receipt OCR) and DUDE (document understanding) datasets
+SROIE: available on Hugging Face or Kaggle
+DUDE: jordyvl/DUDE_loader on Hugging Face
+
+4. meta_data_lvr_sft_stage1.json
+
+This is likely a metadata file pointing to multiple source datasets  
+
+
