@@ -1,36 +1,5 @@
 # Latent Visual 
 
-This repository contains a script for training [Latent Visual Reasoning](https://www.arxiv.org/abs/2509.24251) based on [Qwen2.5-VL](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct).
-
-## Update
-
-- [2025/10/02] 🔥Code base released.
-
-## Table of Contents
-
-- [Latent Visual Reasoning](#latent-visual-reasoning)
-  - [Update](#update)
-  - [Table of Contents](#table-of-contents)
-  - [Supported Features](#supported-features)
-  - [Environments](#environments)
-  - [Model Weights](#model-weights)
-  - [Dataset Preparation](#dataset-preparation)
-  - [Training LVR](#training-lvr)
-    - [Stage-1 SFT](#full-finetuning)
-    - [Stage-2 GRPO<sub>latent</sub>](#stage-2-GRPO<sub>latent</sub>)
-  - [Inference](#inference)
-  - [TODO](#todo)
-  - [Known Issues](#known-issues)
-  - [License](#license)
-  - [Citation](#citation)
-  - [Acknowledgement](#acknowledgement)
-
-## Supported Features
-
-- Deepspeed
-- Full-finetuning
-- GRPO<sub>latent</sub>
-
 
 ### Environments
 
