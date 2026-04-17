@@ -159,6 +159,25 @@ make eval-blink      # BLINK benchmark with HF checkpoint
 make eval-mmvp       # MMVP benchmark with HF checkpoint
 ```
 
+### Checkpoint-specific evaluation (stage1-3b-dimv @ step 1000)
+
+```bash
+make eval-vstar-stage1-3b-dimv-ckpt1000   # V* Bench
+make eval-blink-stage1-3b-dimv-ckpt1000   # BLINK
+make eval-mmvp-stage1-3b-dimv-ckpt1000    # MMVP
+make eval-all-stage1-3b-dimv-ckpt1000     # all three benchmarks
+```
+
+Checkpoint: `checkpoints_rerun/stage1_3b_dimv/checkpoint-1000`
+Results:    `eval_results/stage1_3b_dimv_ckpt1000/`
+Logs:       `logs/eval_{vstar,blink,mmvp}_stage1_3b_dimv_ckpt1000.log`
+
+### Training (stage1-3b-dimv)
+
+```bash
+make train-stage1-3b-dimv   # runs finetune_lvr_stage1_3b_dimv_full_simea.sh
+```
+
 See `Makefile` for the full targets and how to override variables.
 
 ---

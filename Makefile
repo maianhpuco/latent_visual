@@ -288,4 +288,4 @@ train-stage2:
 
 # # Custom output dir
 # make eval-mmvp-stage1-3b-dimv EVAL_OUTPUT_STAGE1_3B_DIMV=./eval_results/my_run
-# Results go to eval_results/stage1_3b_dimv_ckpt1450/mmvp/dimv_L{L:03d}.json and the log to logs/eval_mmvp_stage1_3b_dimv.log. The terminal output will show both per-question accuracy and the standard MMVP pair accuracy for each L value.
+# Results go to eval_results/stage1_3b_dimv_ckpt1450/mmvp/dimv_L{L:03d}.json and the log to logs/eval_mmvp_stage1_3b_dimv.log. The terminal output will show both per-question accuracy and the standard MMVP pair accuracy for each L value. 
