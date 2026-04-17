@@ -9,7 +9,7 @@ from transformers import AutoTokenizer, AutoModel, TrainerCallback
 
 from src.model.qwen_lvr_model import QwenWithLVR
 from src.trainer import QwenLVRSFTTrainer
-from src.dataset import make_supervised_data_module_lvr, make_packed_supervised_data_module_lvr,make_packed_supervised_data_module_lvr_fixedToken
+from src.dataset import make_supervised_data_module_lvr, make_packed_supervised_data_module_lvr, make_packed_supervised_data_module_lvr_fixedToken, make_packed_supervised_data_module_dimv
 from src.params import DataArguments, ModelArguments, TrainingArguments
 
 from train.train_utils import safe_save_model_for_hf_trainer
@@ -22,6 +22,7 @@ except ImportError:
     create_temp_dir = None
 from src.train.monkey_patch_patch_emb import replace_qwen_2_5_vl_patch_emb
 from src.train.monkey_patch_dataloader import replace_train_dataloader
+from src.config.latent_reasoning_config import LatentReasoningConfig
 
 local_rank = None
 
@@ -71,6 +72,14 @@ def rank0_print(*args):
 def set_requires_grad(parameters, requires_grad):
     for p in parameters:
         p.requires_grad = requires_grad
+
+
+def parse_int_list(raw_value):
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, str):
+        return [int(item.strip()) for item in raw_value.split(",") if item.strip()]
+    return [int(item) for item in raw_value]
 
 def configure_vision_tower(model, training_args, compute_dtype, device):
     # Support both old (model.visual) and new (model.model.visual) transformers API
@@ -154,20 +163,41 @@ def train():
     # if its starting a new training
     else:
         model_pth = model_args.model_id
-    
+
+    if model_args.dimv_mode and not training_args.checkpoint_dir_roi:
+        training_args.checkpoint_dir_roi = training_args.output_dir
+
     # get the model config
     config = AutoConfig.from_pretrained(model_pth,trust_remote_code=True)
     config.latent_end_token = model_args.latent_end_token
     config.lvr_head = model_args.lvr_head
     config.lvr_head_type = model_args.lvr_head_type
-    
+
+    # DIMV: store as plain dict so transformers can JSON-serialize it in config.json.
+    # _init_latent_reasoning accepts both dict and LatentReasoningConfig.
+    if model_args.dimv_mode:
+        import dataclasses
+        early_checkpoint_steps = parse_int_list(training_args.early_checkpoint_steps)
+        config.latent_reasoning_config = dataclasses.asdict(LatentReasoningConfig(
+            num_reasoning_slots=model_args.num_reasoning_slots,
+            slot_init=model_args.slot_init,
+            num_refinement_steps=model_args.num_refinement_steps,
+            num_attn_heads=model_args.dimv_num_attn_heads,
+            checkpoint_dir=training_args.checkpoint_dir_roi or training_args.output_dir,
+            vstar_val_fraction=training_args.vstar_val_fraction,
+            validate_every_n_steps=training_args.validate_every_n_steps,
+            early_checkpoint_steps=early_checkpoint_steps,
+            vstar_val_seed=training_args.vstar_val_seed,
+        ))
+
     # Load model based on model type
     if "Qwen2.5" in model_args.model_id:
         # Patch the forward function
         replace_qwen2_5_with_mixed_modality_forward_lvr(coconut=model_args.coconut,
                                                         lvr_head=model_args.lvr_head,
                                                         mode_switch_loss=training_args.mode_switch_loss,
-                                                        latent_end_token=model_args.latent_end_token)
+                                                        latent_end_token=model_args.latent_end_token,
+                                                        dimv_mode=model_args.dimv_mode)
         
         model = QwenWithLVR.from_pretrained(
             model_pth,
@@ -228,6 +258,10 @@ def train():
     model.config.lvr_start_id = lvr_start_id
     model.config.lvr_end_id = lvr_end_id
 
+    # DIMV: register [SLOT_0]…[SLOT_{T_v-1}] and resize embeddings.
+    if model_args.dimv_mode:
+        model.setup_slot_tokens(processor.tokenizer)
+        rank0_print(f"[DIMV] Slot tokens registered: {model.slot_token_ids[:4]}…")
 
     # there are some dummy tokens in newer hf version
     # newer transformers nests vocab_size under text_config for VL models
@@ -249,7 +283,17 @@ def train():
     # model.config.tokenizer_model_max_length = processor.tokenizer.model_max_length
     if training_args.enable_data_packing:
         training_args.per_device_train_batch_size = 1
-        if model_args.max_lvr_tokens is not None:
+
+        if model_args.dimv_mode:
+            slot_token_ids = list(model.slot_token_ids)
+            data_module, total_data_len = make_packed_supervised_data_module_dimv(
+                model_id=model_args.model_id,
+                processor=processor,
+                data_args=data_args,
+                training_args=training_args,
+                slot_token_ids=slot_token_ids,
+            )
+        elif model_args.max_lvr_tokens is not None:
             data_module, total_data_len = make_packed_supervised_data_module_lvr_fixedToken(model_id=model_args.model_id,
                                                                                             processor=processor,
                                                                                             max_lvr_tokens=model_args.max_lvr_tokens,
@@ -263,7 +307,7 @@ def train():
                                                                                 training_args=training_args,
                                                                                 latent_end_token=model_args.latent_end_token)
         if not training_args.max_steps:
-            training_args.max_steps = total_data_len // (training_args.gradient_accumulation_steps 
+            training_args.max_steps = total_data_len // (training_args.gradient_accumulation_steps
                                                          * training_args.world_size
                                                          * training_args.per_device_train_batch_size)
         # Very crucial or the packed data will get incorrectly sliced by the dataloader
@@ -273,6 +317,27 @@ def train():
                                               processor=processor,
                                               data_args=data_args,
                                               latent_end_token=model_args.latent_end_token)
+
+    if (
+        model_args.dimv_mode
+        and training_args.validate_every_n_steps > 0
+        and local_rank in (None, -1, 0, "0")
+    ):
+        from src.eval.vstar_validator import VStarValidator
+
+        val_indices = VStarValidator.create_fixed_val_set(
+            val_fraction=training_args.vstar_val_fraction,
+            seed=training_args.vstar_val_seed,
+            save_path=os.path.join(
+                training_args.checkpoint_dir_roi or training_args.output_dir,
+                "vstar_val_indices.json",
+            ),
+            configs_dir=training_args.vstar_configs_dir,
+        )
+        rank0_print(
+            f"[DIMV] Fixed V* validation split ready: {len(val_indices)} samples "
+            f"from {training_args.vstar_configs_dir or 'auto-detected configs'}."
+        )
     
     # tempFolder = temp_file class; "/dockerx/Local/users/bangzheng/model_name/run_name-[random]"
     trainer = QwenLVRSFTTrainer(

@@ -53,6 +53,35 @@ def get_rank():
     return dist.get_rank()
 
   
+def build_prototype_token_sequence(
+    conversation: list,
+    K: int,
+    proto_token_template: str = "[proto_{k}]",
+) -> list:
+    """
+    Insert K prototype slot tokens into conversation turns at <proto> placeholders.
+
+    The prototype tokens replace the <lvr> placeholder used in original LVR.
+    Instead of <lvr>, training data should use <proto> as the placeholder.
+    It gets expanded to: [proto_0] [proto_1] ... [proto_{K-1}]
+
+    These tokens are replaced at forward-pass time by Z = g_φ(P, O).
+
+    Args:
+        conversation: List of {"role": ..., "content": ...} dicts.
+        K: Number of prototype slots (from PrototypeLVRConfig.num_prototypes).
+        proto_token_template: Template string for each token, formatted with k=index.
+
+    Returns:
+        Modified conversation list with <proto> replaced by K prototype tokens.
+    """
+    proto_span = " ".join(proto_token_template.format(k=k) for k in range(K))
+    for turn in conversation:
+        if isinstance(turn.get("content"), str) and "<proto>" in turn["content"]:
+            turn["content"] = turn["content"].replace("<proto>", proto_span)
+    return conversation
+
+
 def make_packed_supervised_data_module_lvr(model_id, processor, data_args, training_args: TrainingArguments,latent_end_token=False):
 
     """Make dataset and collator for supervised fine-tuning."""
@@ -255,19 +284,22 @@ class IterableSupervisedDatasetLVR(Dataset):
             if isinstance(image_files, str):
                 image_files = [image_files]
 
-            images = []
-
-            for image_file in image_files:
-                if not os.path.exists(image_file):
-                    if not image_file.startswith("http"):
-                        full_path = os.path.join(image_folder, image_file)
-                        if not os.path.exists(full_path):
-                            # Strip leading path component (e.g. "viscot/flickr30k/x.jpg" -> "flickr30k/x.jpg")
-                            parts = image_file.split(os.sep, 1)
-                            if len(parts) > 1:
-                                full_path = os.path.join(image_folder, parts[1])
-                        image_file = full_path
-                images.append(get_image_info(image_file, self.image_min_pixel, self.image_max_pixel, self.image_resized_w, self.image_resized_h))
+            try:
+                images = []
+                for image_file in image_files:
+                    if not os.path.exists(image_file):
+                        if not image_file.startswith("http"):
+                            full_path = os.path.join(image_folder, image_file)
+                            if not os.path.exists(full_path):
+                                # Strip leading path component (e.g. "viscot/flickr30k/x.jpg" -> "flickr30k/x.jpg")
+                                parts = image_file.split(os.sep, 1)
+                                if len(parts) > 1:
+                                    full_path = os.path.join(image_folder, parts[1])
+                            image_file = full_path
+                    images.append(get_image_info(image_file, self.image_min_pixel, self.image_max_pixel, self.image_resized_w, self.image_resized_h))
+            except (FileNotFoundError, OSError) as _img_err:
+                logger.warning(f"[LVR] [{self.ds_name}] Skipping sample {i}: {_img_err}")
+                continue
 
             # Extract LVR tokens
             image_grid_thw = processor(text=[""], images=images, videos=videos, padding=False, do_resize=False, return_tensors='pt')['image_grid_thw']
@@ -543,9 +575,13 @@ class PackedDataset(IterableDataset):
                     if len(self.datasets) == 0:
                         raise StopIteration
                     current_dataset_idx = np.random.choice(len(self.datasets))
-            except:
-                logger.error(f'worker_id{self.worker_id} data_rank={self.data_rank} data_world_size={self.data_world_size} Unexpected error!')
-                # logger.error('Unexpected error!')
+            except Exception as _e:
+                import traceback as _tb
+                logger.error(
+                    f'worker_id{self.worker_id} data_rank={self.data_rank} '
+                    f'data_world_size={self.data_world_size} Unexpected error! '
+                    f'{type(_e).__name__}: {_e}\n{_tb.format_exc(limit=4)}'
+                )
                 if len(self.datasets) == 0:
                     raise StopIteration
                 current_dataset_idx = np.random.choice(len(self.datasets))
@@ -633,18 +669,24 @@ class PackedDataset(IterableDataset):
 
                 if not _image_is_splitted(buffer['input_ids'], cut_id):
                     # count discarded lvr tokens before slicing
-
-                    if lvr_token_id is not None:
+                    cut_id_lvr = 0
+                    has_lvr_tokens = (
+                        lvr_token_id is not None
+                        and buffer.get('lvr_tokens')     # non-empty list guard
+                        and buffer['lvr_tokens'][0].numel() > 0
+                    )
+                    if has_lvr_tokens:
                         num_discarded_lvr_tokens = (buffer['input_ids'][cut_id:] == lvr_token_id).sum().item()
-                        cut_id_lvr = buffer['lvr_tokens'][0].size(0)-num_discarded_lvr_tokens
-                    
+                        cut_id_lvr = buffer['lvr_tokens'][0].size(0) - num_discarded_lvr_tokens
+
                     for k in buffer:
                         if k in ['input_ids', 'labels', 'attention_mask', 'position_ids', 'data_index']:
                             buffer[k] = buffer[k][:cut_id]
                         elif k in ['pixel_values', 'image_flags','image_grid_thw']:
                             buffer[k] = buffer[k]
                         elif k in ['lvr_tokens']:
-                            buffer[k][0] = buffer[k][0][:cut_id_lvr]
+                            if has_lvr_tokens:
+                                buffer[k][0] = buffer[k][0][:cut_id_lvr]
                         elif k in ['input_lengths']:
                             pass
                         else:
@@ -1070,6 +1112,380 @@ class PackedDataCollatorForSupervisedDatasetLVR(object):
 #         "lvr_tokens": all_lvr_tokens,
 #         "pixel_values": pixel_values,
 #         "image_grid_thw": image_grid_thw,
-#         }    
+#         }
 
 #     return data_dict
+
+
+# ---------------------------------------------------------------------------
+# DIMV dataset — slot tokens injected programmatically; no bbox required
+# ---------------------------------------------------------------------------
+
+from .data_utils import llava_to_openai   # noqa: E402  (already imported above as llava_to_openai_lvr)
+
+
+class IterableSupervisedDatasetDIMV(Dataset):
+    """
+    Iterable dataset for DIMV-style latent reasoning fine-tuning.
+
+    Key differences from IterableSupervisedDatasetLVR:
+    - No bounding boxes / no llava_to_openai_lvr; uses plain llava_to_openai.
+    - Slot tokens [SLOT_0] … [SLOT_{T_v-1}] are injected between the prompt
+      and the response at tokenisation time (not in the conversation text).
+    - `lvr_tokens` in the yielded dict is always [] so that PackedDataset's
+      update_buffer key-equality check passes without issues.
+
+    Sequence layout per turn (after system message):
+        <im_start>user\\n…<im_end>\\n<im_start>assistant\\n   ← prompt_input_ids
+        [SLOT_0] [SLOT_1] … [SLOT_{T_v-1}]                  ← slot_ids (T_v tokens)
+        {response text}<im_end>\\n                            ← response_input_ids
+
+    Labels: IGNORE_INDEX for everything except response_input_ids.
+    """
+
+    def __init__(
+        self,
+        data_path: str,
+        image_folder: str,
+        processor: transformers.ProcessorMixin,
+        data_args: DataArguments,
+        ds_name: str,
+        model_id,
+        slot_token_ids: list,           # list of int, length T_v
+        data_rank: int = 0,
+        data_world_size: int = 1,
+        distributed_mode: bool = True,
+        random_seed=None,
+    ):
+        super().__init__()
+        if isinstance(data_path, str):
+            self.raw_data = json.load(open(data_path, "r"))
+        else:
+            self.raw_data = data_path
+
+        self.model_id = model_id
+        self.processor = processor
+        self.data_args = data_args
+        self.image_folder = image_folder
+        self.image_min_pixel = data_args.image_min_pixels
+        self.image_max_pixel = data_args.image_max_pixels
+        self.video_min_pixel = data_args.video_min_pixels
+        self.video_max_pixel = data_args.video_max_pixels
+        self.image_resized_w = data_args.image_resized_width
+        self.image_resized_h = data_args.image_resized_height
+        self.video_resized_w = data_args.video_resized_width
+        self.video_resized_h = data_args.video_resized_height
+        self.ds_name = ds_name
+        self.fps = data_args.fps
+
+        self.slot_token_ids = slot_token_ids  # [int, …] length T_v
+        self.slot_ids_tensor = torch.tensor(slot_token_ids, dtype=torch.long)
+
+        self.data_world_size = data_world_size
+        self.worker_id = None
+        self.worker_state_key = None
+        self.num_workers = 1
+        self.distributed_mode = distributed_mode
+        self.worker_distributed = False
+        self._state_dict = {}
+
+        self.random_seed = None
+        if random_seed:
+            logger.info(f"{self.ds_name} is Shuffled!")
+            self.random_seed = random_seed
+            self.rng = np.random.default_rng(seed=self.random_seed)
+            self.rng.shuffle(self.raw_data)
+
+    def __len__(self):
+        return len(self.raw_data)
+
+    def _enable_worker_distributed(self):
+        if (
+            self.distributed_mode
+            and not self.worker_distributed
+            and self.worker_id is not None
+        ):
+            self.worker_distributed = True
+            self.raw_data = self.raw_data[self.worker_id::self.num_workers]
+            logger.info(
+                f"[DIMV] worker_distributed enabled, {self.num_workers=}, {len(self.raw_data)=}"
+            )
+
+    def __iter__(self):
+        self._enable_worker_distributed()
+        start_idx = 0
+        if self.worker_state_key is None:
+            self.worker_state_key = f"work_state_{self.worker_id}"
+        if (
+            self.worker_state_key in self._state_dict
+            and len(self._state_dict[self.worker_state_key]) > 0
+        ):
+            start_idx = self._state_dict[self.worker_state_key]["current_idx"]
+            self._state_dict.pop(self.worker_state_key)
+
+        if self.worker_id == 0:
+            logger.info(
+                f"[{self.ds_name}] [Worker {self.worker_id}] DIMV iter start_idx={start_idx}"
+            )
+
+        for i in range(start_idx, len(self.raw_data)):
+            sources = self.raw_data[i]
+
+            # ── image loading ───────────────────────────────────────────────
+            try:
+                processor = self.processor
+                videos = None
+                grid_key = "image_grid_thw"
+                pixel_key = "pixel_values"
+
+                image_files = sources["image"]
+                image_folder = self.image_folder
+                if isinstance(image_files, str):
+                    image_files = [image_files]
+
+                images = []
+                for image_file in image_files:
+                    if not os.path.exists(image_file):
+                        if not image_file.startswith("http"):
+                            full_path = os.path.join(image_folder, image_file)
+                            if not os.path.exists(full_path):
+                                parts = image_file.split(os.sep, 1)
+                                if len(parts) > 1:
+                                    full_path = os.path.join(image_folder, parts[1])
+                            image_file = full_path
+                    images.append(
+                        get_image_info(
+                            image_file,
+                            self.image_min_pixel,
+                            self.image_max_pixel,
+                            self.image_resized_w,
+                            self.image_resized_h,
+                        )
+                    )
+            except (FileNotFoundError, OSError) as _img_err:
+                logger.warning(f"[DIMV] [{self.ds_name}] Skipping sample {i}: {_img_err}")
+                continue
+            # ────────────────────────────────────────────────────────────────
+
+            # Use plain llava_to_openai (no bbox, no LVR tokens in text)
+            conv = copy.deepcopy(llava_to_openai(sources["conversations"], is_video=False))
+
+            all_input_ids = []
+            all_labels = []
+            all_pixel_values = []
+            all_image_grid_thw = []
+
+            # System message
+            if len(SYSTEM_MESSAGE) > 0:
+                system_message = (
+                    f"{DEFAULT_IM_START_TOKEN}system\n{SYSTEM_MESSAGE}{DEFAULT_IM_END_TOKEN}\n"
+                )
+                system_input_ids = processor.tokenizer(
+                    system_message, add_special_tokens=False, return_tensors="pt"
+                )["input_ids"]
+                system_labels = torch.full_like(system_input_ids, IGNORE_INDEX)
+                all_input_ids.append(system_input_ids.squeeze(0))
+                all_labels.append(system_labels.squeeze(0))
+
+            for j in range(0, len(conv), 2):
+                user_turn = conv[j]
+                gpt_turn = conv[j + 1]
+
+                user_text = (
+                    f"{DEFAULT_IM_START_TOKEN}{user_turn['role']}\n"
+                    f"{user_turn['content']}"
+                    f"{DEFAULT_IM_END_TOKEN}\n"
+                    f"{DEFAULT_IM_START_TOKEN}{gpt_turn['role']}\n"
+                )
+                response_text = f"{gpt_turn['content']}{DEFAULT_IM_END_TOKEN}\n"
+
+                # Tokenise prompt (with image if present)
+                if DEFAULT_IMAGE_TOKEN in user_text:
+                    inputs = processor(
+                        text=[user_text],
+                        images=images,
+                        videos=videos,
+                        padding=False,
+                        do_resize=False,
+                        return_tensors="pt",
+                    )
+                    prompt_input_ids = inputs["input_ids"]  # [1, L_p]
+                    all_pixel_values.append(inputs[pixel_key])
+                    all_image_grid_thw.append(inputs[grid_key])
+                else:
+                    prompt_input_ids = processor.tokenizer(
+                        user_text,
+                        add_special_tokens=False,
+                        padding=False,
+                        return_tensors="pt",
+                    )["input_ids"]
+
+                response_input_ids = processor.tokenizer(
+                    response_text,
+                    add_special_tokens=False,
+                    padding=False,
+                    return_tensors="pt",
+                )["input_ids"]  # [1, L_r]
+
+                # Layout: prompt | slot_ids | response
+                slot_ids = self.slot_ids_tensor  # [T_v]
+                prompt_ids_1d = prompt_input_ids.squeeze(0)   # [L_p]
+                response_ids_1d = response_input_ids.squeeze(0)  # [L_r]
+
+                input_ids = torch.cat([prompt_ids_1d, slot_ids, response_ids_1d], dim=0)
+
+                T_v = slot_ids.size(0)
+                labels = torch.cat(
+                    [
+                        torch.full((len(prompt_ids_1d),), IGNORE_INDEX, dtype=torch.long),
+                        torch.full((T_v,), IGNORE_INDEX, dtype=torch.long),
+                        response_ids_1d,
+                    ],
+                    dim=0,
+                )
+
+                all_input_ids.append(input_ids)
+                all_labels.append(labels)
+
+            input_ids = torch.cat(all_input_ids, dim=0).to(torch.long)
+            labels = torch.cat(all_labels, dim=0).to(torch.long)
+            attention_mask = (input_ids > -1_000_000).to(torch.long)
+
+            data_dict = dict(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                lvr_tokens=[],   # empty — PackedDataset keys must match across samples
+            )
+
+            if all_pixel_values:
+                data_dict[pixel_key] = torch.cat(all_pixel_values, dim=0)
+                data_dict[grid_key] = torch.cat(all_image_grid_thw, dim=0)
+
+            data_dict["input_lengths"] = torch.tensor([input_ids.size(0)])
+
+            yield data_dict
+
+
+def make_packed_supervised_data_module_dimv(
+    model_id,
+    processor,
+    data_args,
+    training_args: TrainingArguments,
+    slot_token_ids: list,
+):
+    """
+    Build PackedDataset + collator for DIMV-style latent reasoning training.
+
+    Args:
+        slot_token_ids: list of int, token ids for [SLOT_0]…[SLOT_{T_v-1}].
+                        Obtained from model.slot_token_ids after setup_slot_tokens().
+    """
+    data_rank = dist.get_rank()
+    data_world_size = dist.get_world_size()
+
+    meta_data = json.load(open(data_args.data_path))
+
+    datasets = []
+    total_data_len = 0
+    for meta in meta_data:
+        iterable_ds = IterableSupervisedDatasetDIMV(
+            data_path=meta["data_path"],
+            image_folder=meta["image_folder"],
+            ds_name=meta["ds_name"],
+            processor=processor,
+            data_args=data_args,
+            model_id=model_id,
+            slot_token_ids=slot_token_ids,
+            data_rank=data_rank,
+            data_world_size=data_world_size,
+            distributed_mode=training_args.enable_data_packing,
+            random_seed=data_args.random_seed,
+        )
+        datasets.append(iterable_ds)
+        total_data_len += len(iterable_ds)
+
+    packed_train_dataset = PackedDataset(
+        tokenizer=processor.tokenizer,
+        datasets=datasets,
+        data_rank=data_rank,
+        data_world_size=data_world_size,
+        max_packed_tokens=training_args.max_packed_tokens,
+        max_buffer_size=100,
+        long_seq_threshold=training_args.long_seq_threshold,
+        max_instance_per_batch=training_args.max_instance_per_batch,
+    )
+
+    data_collator = PackedDataCollatorForSupervisedDatasetDIMV(
+        pad_token_id=processor.tokenizer.pad_token_id
+    )
+
+    return dict(
+        train_dataset=packed_train_dataset,
+        eval_dataset=None,
+        data_collator=data_collator,
+    ), total_data_len
+
+
+class PackedDataCollatorForSupervisedDatasetDIMV(object):
+    """
+    Collator for DIMV packed batches.
+
+    Identical to PackedDataCollatorForSupervisedDatasetLVR except:
+    - `lvr_tokens` is always [] and is kept as-is (no stacking needed).
+    - No crash if pixel_values / image_grid_thw are absent from a feature
+      (shouldn't happen in practice, but defensive for unit tests).
+    """
+
+    def __init__(self, pad_token_id: int):
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, features):
+        if not isinstance(features, list):
+            features = [features]
+
+        all_input_ids = []
+        all_attention_masks = []
+        all_labels = []
+        all_pixel_values = []
+        all_image_grid_thw = []
+
+        for feature in features:
+            all_input_ids.extend(
+                torch.split(feature["input_ids"], feature["input_lengths"].tolist())
+            )
+            all_attention_masks.extend(
+                torch.split(feature["attention_mask"], feature["input_lengths"].tolist())
+            )
+            all_labels.extend(
+                torch.split(feature["labels"], feature["input_lengths"].tolist())
+            )
+            if "pixel_values" in feature:
+                all_pixel_values.append(feature["pixel_values"])
+                all_image_grid_thw.append(feature["image_grid_thw"])
+
+        # Pad to uniform length within the micro-batch
+        max_len = max(len(seq) for seq in all_input_ids)
+        padded_input_ids, padded_masks, padded_labels = [], [], []
+        for ids, mask, lbl in zip(all_input_ids, all_attention_masks, all_labels):
+            pad = max_len - len(ids)
+            padded_input_ids.append(
+                torch.nn.functional.pad(ids, (0, pad), value=self.pad_token_id)
+            )
+            padded_masks.append(torch.nn.functional.pad(mask, (0, pad), value=0))
+            padded_labels.append(
+                torch.nn.functional.pad(lbl, (0, pad), value=IGNORE_INDEX)
+            )
+
+        data_dict = {
+            "input_ids": torch.stack(padded_input_ids),
+            "attention_mask": torch.stack(padded_masks),
+            "labels": torch.stack(padded_labels),
+            "lvr_tokens": [],  # unused in DIMV forward; kept for API symmetry
+        }
+
+        if all_pixel_values:
+            data_dict["pixel_values"] = torch.cat(all_pixel_values)
+            data_dict["image_grid_thw"] = torch.cat(all_image_grid_thw)
+
+        return data_dict

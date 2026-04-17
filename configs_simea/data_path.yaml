@@ -1,0 +1,108 @@
+evaluation:
+  blink:
+    root: /home/mvu9/datasets/lvr_data/blink_extracted
+    source_parquet_root: /home/mvu9/datasets/lvr_data/blink
+    subtasks:
+      Art_Style:
+        val_records: /home/mvu9/datasets/lvr_data/blink_extracted/Art_Style/val/records.jsonl
+        test_records: /home/mvu9/datasets/lvr_data/blink_extracted/Art_Style/test/records.jsonl
+        val_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Art_Style/val/images
+        test_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Art_Style/test/images
+      Counting:
+        val_records: /home/mvu9/datasets/lvr_data/blink_extracted/Counting/val/records.jsonl
+        test_records: /home/mvu9/datasets/lvr_data/blink_extracted/Counting/test/records.jsonl
+        val_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Counting/val/images
+        test_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Counting/test/images
+      Forensic_Detection:
+        val_records: /home/mvu9/datasets/lvr_data/blink_extracted/Forensic_Detection/val/records.jsonl
+        test_records: /home/mvu9/datasets/lvr_data/blink_extracted/Forensic_Detection/test/records.jsonl
+        val_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Forensic_Detection/val/images
+        test_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Forensic_Detection/test/images
+      Functional_Correspondence:
+        val_records: /home/mvu9/datasets/lvr_data/blink_extracted/Functional_Correspondence/val/records.jsonl
+        test_records: /home/mvu9/datasets/lvr_data/blink_extracted/Functional_Correspondence/test/records.jsonl
+        val_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Functional_Correspondence/val/images
+        test_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Functional_Correspondence/test/images
+      IQ_Test:
+        val_records: /home/mvu9/datasets/lvr_data/blink_extracted/IQ_Test/val/records.jsonl
+        test_records: /home/mvu9/datasets/lvr_data/blink_extracted/IQ_Test/test/records.jsonl
+        val_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/IQ_Test/val/images
+        test_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/IQ_Test/test/images
+      Jigsaw:
+        val_records: /home/mvu9/datasets/lvr_data/blink_extracted/Jigsaw/val/records.jsonl
+        test_records: /home/mvu9/datasets/lvr_data/blink_extracted/Jigsaw/test/records.jsonl
+        val_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Jigsaw/val/images
+        test_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Jigsaw/test/images
+      Multi-view_Reasoning:
+        val_records: /home/mvu9/datasets/lvr_data/blink_extracted/Multi-view_Reasoning/val/records.jsonl
+        test_records: /home/mvu9/datasets/lvr_data/blink_extracted/Multi-view_Reasoning/test/records.jsonl
+        val_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Multi-view_Reasoning/val/images
+        test_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Multi-view_Reasoning/test/images
+      Object_Localization:
+        val_records: /home/mvu9/datasets/lvr_data/blink_extracted/Object_Localization/val/records.jsonl
+        test_records: /home/mvu9/datasets/lvr_data/blink_extracted/Object_Localization/test/records.jsonl
+        val_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Object_Localization/val/images
+        test_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Object_Localization/test/images
+      Relative_Depth:
+        val_records: /home/mvu9/datasets/lvr_data/blink_extracted/Relative_Depth/val/records.jsonl
+        test_records: /home/mvu9/datasets/lvr_data/blink_extracted/Relative_Depth/test/records.jsonl
+        val_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Relative_Depth/val/images
+        test_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Relative_Depth/test/images
+      Relative_Reflectance:
+        val_records: /home/mvu9/datasets/lvr_data/blink_extracted/Relative_Reflectance/val/records.jsonl
+        test_records: /home/mvu9/datasets/lvr_data/blink_extracted/Relative_Reflectance/test/records.jsonl
+        val_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Relative_Reflectance/val/images
+        test_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Relative_Reflectance/test/images
+      Semantic_Correspondence:
+        val_records: /home/mvu9/datasets/lvr_data/blink_extracted/Semantic_Correspondence/val/records.jsonl
+        test_records: /home/mvu9/datasets/lvr_data/blink_extracted/Semantic_Correspondence/test/records.jsonl
+        val_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Semantic_Correspondence/val/images
+        test_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Semantic_Correspondence/test/images
+      Spatial_Relation:
+        val_records: /home/mvu9/datasets/lvr_data/blink_extracted/Spatial_Relation/val/records.jsonl
+        test_records: /home/mvu9/datasets/lvr_data/blink_extracted/Spatial_Relation/test/records.jsonl
+        val_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Spatial_Relation/val/images
+        test_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Spatial_Relation/test/images
+      Visual_Correspondence:
+        val_records: /home/mvu9/datasets/lvr_data/blink_extracted/Visual_Correspondence/val/records.jsonl
+        test_records: /home/mvu9/datasets/lvr_data/blink_extracted/Visual_Correspondence/test/records.jsonl
+        val_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Visual_Correspondence/val/images
+        test_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Visual_Correspondence/test/images
+      Visual_Similarity:
+        val_records: /home/mvu9/datasets/lvr_data/blink_extracted/Visual_Similarity/val/records.jsonl
+        test_records: /home/mvu9/datasets/lvr_data/blink_extracted/Visual_Similarity/test/records.jsonl
+        val_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Visual_Similarity/val/images
+        test_images_dir: /home/mvu9/datasets/lvr_data/blink_extracted/Visual_Similarity/test/images
+
+  vstar_bench:
+    root: /home/mvu9/datasets/lvr_data/vstar_bench
+    test_questions: /home/mvu9/datasets/lvr_data/vstar_bench/test_questions.jsonl
+    direct_attributes_dir: /home/mvu9/datasets/lvr_data/vstar_bench/direct_attributes
+    relative_position_dir: /home/mvu9/datasets/lvr_data/vstar_bench/relative_position
+
+  mmvp:
+    root: /home/mvu9/datasets/lvr_data/mmvp
+    questions_csv: /home/mvu9/datasets/lvr_data/mmvp/Questions.csv
+    images_dir: /home/mvu9/datasets/lvr_data/mmvp/MMVP Images
+
+training:
+  visual_cot:
+    root: /home/mvu9/datasets/lvr_data/Visual-CoT
+    viscot_363k_json: /home/mvu9/datasets/lvr_data/Visual-CoT/viscot_363k.json
+    viscot_mixed_2m_json: /home/mvu9/datasets/lvr_data/Visual-CoT/viscot_mixed_2m.json
+    metadata_dir: /home/mvu9/datasets/lvr_data/Visual-CoT/metadata
+    detailed_reasoning_dir: /home/mvu9/datasets/lvr_data/Visual-CoT/cot_with_detailed_reasoning_steps
+    image_archives_dir: /home/mvu9/datasets/lvr_data/Visual-CoT/cot_images_tar_split
+    # --- LVR-formatted training data (use these for Stage-1 SFT) ---
+    lvr_formatted_json: /home/mvu9/datasets/lvr_data/lvr_train/viscot_363k_lvr_formatted.json
+    image_folder: /home/mvu9/datasets/lvr_data/Visual-CoT/images/cot_image_data
+
+  virl39k:
+    root: /home/mvu9/datasets/lvr_data/ViRL39K
+    main_parquet: /home/mvu9/datasets/lvr_data/ViRL39K/39Krelease.parquet
+    images_zip: /home/mvu9/datasets/lvr_data/ViRL39K/images.zip
+    extracted_images_dir: /home/mvu9/datasets/lvr_data/ViRL39K/images
+    # --- LVR-formatted training data (use these for Stage-2 RL) ---
+    lvr_formatted_json: /home/mvu9/datasets/lvr_data/lvr_train/virl39k.json
+    image_folder: /home/mvu9/datasets/lvr_data/ViRL39K/images/images
+ 

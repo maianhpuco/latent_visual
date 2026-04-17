@@ -1,0 +1,19 @@
+# ============================================================
+# Server: MAUI  (V100 — no flash_attn, use sdpa)
+# ============================================================
+SERVER       = maui
+PYTHON       = /project/hnguyen2/mvu9/conda_envs/latent_visual/bin/python
+REPO_ROOT    = /project/hnguyen2/mvu9/folder_04_ma/latent_visual
+DATA_ROOT    = /project/hnguyen2/mvu9/datasets/lvr_data
+PYTHONPATH_CMD = PYTHONPATH=$(REPO_ROOT):$$PYTHONPATH PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+CHECKPOINT        ?= $(REPO_ROOT)/checkpoints/LVR-7B
+LORA_CHECKPOINT   ?= $(REPO_ROOT)/checkpoints_rerun/stage1_3b_lora/checkpoint-2000
+IMAGE             ?= $(DATA_ROOT)/vstar_bench/direct_attributes/sa_4690.jpg
+CONFIGS_DIR       = configs
+INFER_CMD         = $(PYTHONPATH_CMD)
+
+# Per-server training scripts
+SCRIPT_STAGE1_3B          = scripts/finetune_lvr_stage1_3b.sh
+SCRIPT_STAGE1_3B_LORA     = scripts/finetune_lvr_stage1_3b_lora.sh
+SCRIPT_STAGE1_3B_1GPU     = scripts/finetune_lvr_stage1_3b.sh  # maui: no 1-GPU variant, falls back to full script

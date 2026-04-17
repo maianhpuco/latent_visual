@@ -1,6 +1,7 @@
 # ── Model checkpoints (large binary files, multi-GB) ────────────────────────
 checkpoints/
 checkpoints_rerun/
+checkpoint*
 
 # ── Training & eval logs ────────────────────────────────────────────────────
 logs/
@@ -35,3 +36,4 @@ inference copy.py
 *.tmp
 *.swp
 *.swo
+.env.simea

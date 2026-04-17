@@ -15,6 +15,17 @@ class ModelArguments:
     lvr_head_type: str = field(default="simple")
     latent_end_token: bool = field(default=False)
     max_lvr_tokens: int = field(default=None)
+    # Prototype-based parallel LVR
+    prototype_mode: bool = field(default=False)
+    num_prototypes: int = field(default=8)
+    prototype_num_heads: int = field(default=8)
+    prototype_dropout: float = field(default=0.1)
+    # DIMV-style latent reasoning
+    dimv_mode: bool = field(default=False)
+    num_reasoning_slots: int = field(default=64)
+    num_refinement_steps: int = field(default=2)
+    slot_init: str = field(default="learned")
+    dimv_num_attn_heads: int = field(default=8)
 
 
 @dataclass
@@ -64,6 +75,8 @@ class TrainingArguments(HFTrainingArguments):
     vision_lr: Optional[float] = None
     merger_lr: Optional[float] = None
     lvr_head_lr: Optional[float] = None
+    prototype_lr: Optional[float] = None
+    latent_reasoning_lr: Optional[float] = None
     lora_namespan_exclude: str = field(default=None, metadata={"help": "List of namespan to exclude for LoRA"})
     num_lora_modules: int = -1
     # use_liger: bool = True
@@ -78,10 +91,42 @@ class TrainingArguments(HFTrainingArguments):
     long_seq_threshold:Optional[int] = field(default=4096, metadata={"help": "Threshold to be a long single instance"})
     max_instance_per_batch:Optional[int] = 4
     max_steps:Optional[int] = 2500
+    checkpoint_dir_roi: Optional[str] = field(
+        default=None,
+        metadata={"help": "Directory used for DIMV checkpoints and validation artifacts. Defaults to output_dir."},
+    )
+    validate_every_n_steps: int = field(
+        default=500,
+        metadata={"help": "For DIMV runs, save a checkpoint and run V* validation every N steps."},
+    )
+    early_checkpoint_steps: str = field(
+        default="10,100",
+        metadata={"help": "Comma-separated DIMV checkpoint steps to save before the regular cadence starts."},
+    )
+    vstar_val_fraction: float = field(
+        default=0.30,
+        metadata={"help": "Fraction of V* used for the fixed DIMV validation split."},
+    )
+    vstar_val_seed: int = field(
+        default=42,
+        metadata={"help": "Seed used to sample the fixed DIMV V* validation split."},
+    )
+    vstar_configs_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Repo configs directory that contains evaluation.vstar_bench paths."},
+    )
+    vstar_max_new_tokens: int = field(
+        default=32,
+        metadata={"help": "Maximum answer length for DIMV V* validation generation."},
+    )
 
     mode_switch_loss: Optional[bool] = False
     loss_mode_switch_fct: Optional[str] = field(default="mse")
-    loss_mode_switch_lambda:Optional[float] = field(default=1e-1)
+    loss_mode_switch_lambda: Optional[float] = field(default=1e-1)
+    # Prototype auxiliary loss weights
+    loss_diversity_lambda: float = field(default=0.05)
+    loss_focus_lambda: float = field(default=0.01)
+    warmup_steps_prototype_only: int = field(default=500)
 
 
 @dataclass

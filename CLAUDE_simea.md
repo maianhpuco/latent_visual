@@ -1,11 +1,15 @@
-# Latent Visual Project — Claude Rules
+# Latent Visual Project — Claude Rules (Server: SIMEA)
+using conda environment: conda activate /home/mvu9/conda_envs/latent_visual
+
+> **Server rule:** This project runs on two servers. Use `CLAUDE_maui.md` when on **maui**, and `CLAUDE_simea.md` when on **simea**. Each server has its own Makefile, config, and instruction file — do not mix them.
 ## Permissions
 - You have full autonomy in this repo — no need to ask before editing, running, or installing
 - Only restriction: follow the tmux session rules and never touch `*_old/` directories 
 
 ## Environment
-- Python: use conda env `/project/hnguyen2/mvu9/conda_envs/latent_visual`
-- **Flash Attention is not available** — the model will use `sdpa` (Scaled Dot-Product Attention) instead. Do not attempt to install or enable `flash_attn`
+- Python: use conda env `/home/mvu9/conda_envs/latent_visual`
+- **GPU: supports Flash Attention** — `flash_attn` can be installed and enabled on this server. Use it for better memory efficiency and speed
+- **GPU allocation: ONLY use GPUs 4,5,6,7** — GPUs 0,1,2,3 are reserved. Always set `CUDA_VISIBLE_DEVICES=4,5,6,7` in all training and inference scripts
 
 ## Running Code — tmux Sessions
 | Task | tmux Session | GPUs |
@@ -35,8 +39,8 @@
 - This is the single reference for how to run everything in this repo 
 ---
 
---data_path /project/hnguyen2/mvu9/datasets/lvr_data/lvr_train/viscot_363k_lvr_formatted.json
---image_folder /project/hnguyen2/mvu9/datasets/lvr_data/Visual-CoT/images/cot_image_data
+--data_path /home/mvu9/datasets/lvr_data/lvr_train/viscot_363k_lvr_formatted.json
+--image_folder /home/mvu9/datasets/lvr_data/Visual-CoT/images/cot_image_data
  
 
 # Data & Path Reference
@@ -52,7 +56,7 @@ Always check that file first before looking for data locations.
 ## Data Root
 
 ```
-/project/hnguyen2/mvu9/datasets/lvr_data/
+/home/mvu9/datasets/lvr_data/
 ```
 
 ---
@@ -71,8 +75,8 @@ Always check that file first before looking for data locations.
 
 | Key | Path |
 |-----|------|
-| **JSON (pass to `--data_path`)** | `/project/hnguyen2/mvu9/datasets/lvr_data/lvr_train/viscot_363k_lvr_formatted.json` |
-| **Image folder (pass to `--image_folder`)** | `/project/hnguyen2/mvu9/datasets/lvr_data/Visual-CoT/images/cot_image_data` |
+| **JSON (pass to `--data_path`)** | `/home/mvu9/datasets/lvr_data/lvr_train/viscot_363k_lvr_formatted.json` |
+| **Image folder (pass to `--image_folder`)** | `/home/mvu9/datasets/lvr_data/Visual-CoT/images/cot_image_data` |
 
 Config key: `training.visual_cot.lvr_formatted_json` and `training.visual_cot.image_folder` in `configs/data_path.yaml`.
 
@@ -101,8 +105,8 @@ ViRL39K/
 
 | Key | Path |
 |-----|------|
-| **JSON (pass to `--data_path`)** | `/project/hnguyen2/mvu9/datasets/lvr_data/lvr_train/virl39k.json` |
-| **Image folder (pass to `--image_folder`)** | `/project/hnguyen2/mvu9/datasets/lvr_data/ViRL39K/images/images` |
+| **JSON (pass to `--data_path`)** | `/home/mvu9/datasets/lvr_data/lvr_train/virl39k.json` |
+| **Image folder (pass to `--image_folder`)** | `/home/mvu9/datasets/lvr_data/ViRL39K/images/images` |
 
 Config key: `training.virl39k.lvr_formatted_json` and `training.virl39k.image_folder` in `configs/data_path.yaml`.
 
@@ -176,7 +180,7 @@ blink_extracted/
 | Stage-1 SFT | `lvr_train/meta_data_lvr_sft_stage1.json` | see warning above — needs symlink fix |
 | Stage-2 RL  | `lvr_train/virl39k.json` | see warning above — needs symlink fix |
 
-All paths are relative to `/project/hnguyen2/mvu9/datasets/lvr_data/` unless absolute.
+All paths are relative to `/home/mvu9/datasets/lvr_data/` unless absolute.
 
 ---
 

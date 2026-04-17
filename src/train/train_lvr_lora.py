@@ -9,7 +9,7 @@ from transformers import AutoTokenizer, AutoModel, TrainerCallback
 
 from src.model.qwen_lvr_model import QwenWithLVR
 from src.trainer import QwenLVRSFTTrainer
-from src.dataset import make_supervised_data_module_lvr, make_packed_supervised_data_module_lvr, make_packed_supervised_data_module_lvr_fixedToken
+from src.dataset import make_supervised_data_module_lvr, make_packed_supervised_data_module_lvr, make_packed_supervised_data_module_lvr_fixedToken, make_packed_supervised_data_module_dimv
 from src.params import DataArguments, ModelArguments, TrainingArguments
 
 from train.train_utils import safe_save_model_for_hf_trainer
@@ -22,6 +22,7 @@ except ImportError:
     create_temp_dir = None
 from src.train.monkey_patch_patch_emb import replace_qwen_2_5_vl_patch_emb
 from src.train.monkey_patch_dataloader import replace_train_dataloader
+from src.config.latent_reasoning_config import LatentReasoningConfig
 
 local_rank = None
 
@@ -126,12 +127,24 @@ def train():
     config.lvr_head = model_args.lvr_head
     config.lvr_head_type = model_args.lvr_head_type
 
+    # DIMV: store as plain dict so transformers can JSON-serialize it in config.json.
+    # _init_latent_reasoning accepts both dict and LatentReasoningConfig.
+    if model_args.dimv_mode:
+        import dataclasses
+        config.latent_reasoning_config = dataclasses.asdict(LatentReasoningConfig(
+            num_reasoning_slots=model_args.num_reasoning_slots,
+            slot_init=model_args.slot_init,
+            num_refinement_steps=model_args.num_refinement_steps,
+            num_attn_heads=model_args.dimv_num_attn_heads,
+        ))
+
     if "Qwen2.5" in model_args.model_id:
         replace_qwen2_5_with_mixed_modality_forward_lvr(
             coconut=model_args.coconut,
             lvr_head=model_args.lvr_head,
             mode_switch_loss=training_args.mode_switch_loss,
             latent_end_token=model_args.latent_end_token,
+            dimv_mode=model_args.dimv_mode,
         )
         model = QwenWithLVR.from_pretrained(
             model_pth,
@@ -153,7 +166,10 @@ def train():
 
     # ── LoRA ──────────────────────────────────────────────────────────────────
     rank0_print("Applying LoRA...")
+    # In DIMV mode, exclude latent_reasoning from LoRA — it is trained fully.
     lora_namespan_exclude = ["visual", "lm_head"]
+    if model_args.dimv_mode:
+        lora_namespan_exclude.append("latent_reasoning")
     target_modules = find_target_linear_names(model, lora_namespan_exclude=lora_namespan_exclude)
 
     peft_config = LoraConfig(
@@ -166,6 +182,16 @@ def train():
     )
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
+
+    # In DIMV mode, latent_reasoning params were frozen by PEFT — unfreeze them.
+    if model_args.dimv_mode:
+        for name, param in model.named_parameters():
+            if "latent_reasoning" in name:
+                param.requires_grad = True
+        rank0_print(
+            f"[DIMV] latent_reasoning params unfrozen: "
+            f"{sum(p.numel() for n, p in model.named_parameters() if 'latent_reasoning' in n):,}"
+        )
 
     # Freeze vision tower (peft unfreezes everything by default)
     configure_vision_tower(model, training_args, compute_dtype, training_args.device)
@@ -195,6 +221,12 @@ def train():
     model.config.lvr_start_id     = lvr_start_id
     model.config.lvr_end_id       = lvr_end_id
 
+    # DIMV: add [SLOT_0]…[SLOT_{T_v-1}] tokens and resize embeddings.
+    # model.setup_slot_tokens is resolved via PEFT's __getattr__ chain to QwenWithLVR.
+    if model_args.dimv_mode:
+        model.setup_slot_tokens(processor.tokenizer)
+        rank0_print(f"[DIMV] Slot tokens registered: {model.slot_token_ids[:4]}…")
+
     _vocab_size = getattr(model.config, 'vocab_size', None)
     if _vocab_size is None:
         _text_cfg = getattr(model.config, 'text_config', None)
@@ -206,7 +238,18 @@ def train():
 
     if training_args.enable_data_packing:
         training_args.per_device_train_batch_size = 1
-        if model_args.max_lvr_tokens is not None:
+
+        if model_args.dimv_mode:
+            # DIMV always uses the DIMV dataset — slot_token_ids come from the model
+            slot_token_ids = list(model.slot_token_ids)
+            data_module, total_data_len = make_packed_supervised_data_module_dimv(
+                model_id=model_args.model_id,
+                processor=processor,
+                data_args=data_args,
+                training_args=training_args,
+                slot_token_ids=slot_token_ids,
+            )
+        elif model_args.max_lvr_tokens is not None:
             data_module, total_data_len = make_packed_supervised_data_module_lvr_fixedToken(
                 model_id=model_args.model_id, processor=processor,
                 max_lvr_tokens=model_args.max_lvr_tokens, data_args=data_args,

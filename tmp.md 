@@ -1,0 +1,134 @@
+CHECK POITN AT 2000 
+
+Loading checkpoint shards: 100%|█████████████████████████████████████████████████████████████████████████████████| 2/2 [00:01<00:00,  1.31it/s]
+Loading LoRA adapter and merging weights...
+LoRA adapter merged successfully.
+Model loaded successfully.
+
+Running benchmark: vstar  →  results in ./eval_results/vstar
+[vstar] steps=4: 100%|███████████████████████████████████████████████████████████████████████████████████████| 191/191 [04:29<00:00,  1.41s/it]
+[vstar] steps= 4  Accuracy: 64/191 = 33.51%
+  direct_attributes: 50/115 = 43.48%
+  relative_position: 14/76 = 18.42%
+[vstar] steps=8: 100%|███████████████████████████████████████████████████████████████████████████████████████| 191/191 [04:10<00:00,  1.31s/it]
+[vstar] steps= 8  Accuracy: 53/191 = 27.75%
+  direct_attributes: 40/115 = 34.78%
+  relative_position: 13/76 = 17.11%
+[vstar] steps=16:  51%|████████████████████████████████████████████▏                                          | 97/191 [02:33<02:34,  1[vstar] steps=16:  51%|████████████████████████████████████████████▋                                          | 98/191 [02:34<02:13,  1[vstar] steps=16:  52%|█████████████████████████████████████████████                                          | 99/191 [02:35<01:59,  1[vstar] steps=16:  52%|█████████████████████████████████████████████                                         | 100/191 [02:36<01:58,  1[vstar] steps=16:  53%|█████████████████████████████████████████████▍                                        | 101/191 [02:37<01:53,  1[vstar] steps=16: 100%|██████████████████████████████████████████████████████████████████████████████████████| 191/191 [04:35<00:00,  1.44s/it]
+[vstar] steps=16  Accuracy: 59/191 = 30.89%
+  direct_attributes: 43/115 = 37.39%
+  relative_position: 16/76 = 21.05%
+
+Summary (overall accuracy by steps):
+steps=4: 33.51%,steps=8: 27.75%,steps=16: 30.89% 
+
+
+
+---- 
+
+Functions in this full FT + prototype version:
+
+Component	Role
+PrototypeBank	K=8 learnable prototype vectors P ∈ ℝ^{K×D} — the "slots"
+PrototypeCrossAttention	z_k = g_φ(p_k, O) — each prototype attends to visual context O independently
+PrototypeWarmupCallback	Steps 0–499: freeze LLM, train prototypes only. Step 500+: unfreeze LLM
+TimeEstimationCallback	Prints ETA + GPU memory at each log step
+Full FT (no LoRA)	Entire LLM backbone is plastic (freeze_llm=False, lora_enable=False)
+Frozen vision tower + merger	freeze_vision_tower=True, freeze_merger=True — visual encoder is fixed
+Diversity loss	loss_diversity_lambda=0.05 — pushes prototypes apart
+Focus loss	loss_focus_lambda=0.01 — encourages sparse attention weights
+Data packing	Sequences packed up to 8192 tokens, max 2 instances per batch
+DeepSpeed ZeRO-3 + CPU offload	Fits 3B full FT across 4 GPUs via zero3_offload.json
+Learning rates:
+
+LLM: 1e-5 (low — catastrophic forgetting risk with full FT)
+Prototype modules: 5e-4 (high — randomly initialised, needs fast convergence)
+The key design property: ∂z_k/∂z_j = 0 — all K prototypes are computed in parallel with no cross-slot gradient, so each slot learns independently. 
+
+
+
+Loss Functions in Prototype Mode
+What's computed (3 losses)
+1. L_CE — Cross-Entropy (monkey_patch_forward_lvr.py:313-316)
+
+
+Standard next-token prediction loss.
+[proto_k] token positions are masked from labels (IGNORE_INDEX)
+so prototype slots don't "teach" the model to predict them as text.
+2. L_div — Diversity (monkey_patch_forward_lvr.py:327-332)
+
+
+Z_norm = F.normalize(Z_f, dim=-1)           # [B, K, D]
+sim    = bmm(Z_norm, Z_norm.T)               # [B, K, K]
+loss_div = (sim[:, off_diag] ** 2).mean()   # penalise cos² between pairs
+Goal: push prototype output vectors apart so each slot specialises in a different visual aspect.
+λ = 0.05
+
+3. L_focus — Attention Entropy (monkey_patch_forward_lvr.py:334-337)
+
+
+entropy    = -(A * (A + eps).log()).sum(dim=-1)  # [B, K]
+loss_focus = entropy.mean()
+Goal: minimising entropy → peaked/focused attention per slot → each prototype attends to specific regions, not the whole image.
+λ = 0.01
+
+How they combine (trainer compute_loss)
+
+L_proto = 0.05 × L_div + 0.01 × L_focus
+L_total = L_CE  +  1.0 × L_proto
+loss_lvr_lambda = 1.0 is set in the shell script. The prototype aux loss is passed through the loss_lvr field in the output dataclass (reusing that slot).
+
+Where each is configured
+Parameter	Set in	Value
+loss_diversity_lambda	params.py:92, shell script	0.05
+loss_focus_lambda	params.py:93, shell script	0.01
+loss_lvr_lambda (scales L_proto)	params.py:34, shell script	1.0
+loss_lvr_fct (unused in proto mode)	shell script	mse
+Bugs Found
+Bug 1 — Crash when loss_proto is None (lvr_trainer.py:269)
+
+If a batch has no prototype tokens (or _last_proto_Z is not set), loss_lvr comes back as None. The trainer then does:
+
+
+# loss_lvr_lambda = 1.0 > 0, so the "if" branch fires:
+loss = loss_ce + 1.0 * None   # ← TypeError crash
+Fix:
+
+Read lvr_trainer.py (lines 266-270)
+Edit lvr_trainer.py
+Added 4 lines
+Bug 2 — _last_proto_Z stale state (monkey_patch_forward_lvr.py)
+
+The instance variables _last_proto_Z / _last_proto_attn_weights are never reset at the start of a forward pass. If a batch skips prototype injection, the loss uses the previous step's Z silently. Fix — reset at top of forward:
+
+Read monkey_patch_forward_lvr.py (lines 184-203)
+Edit monkey_patch_forward_lvr.py
+Added 4 lines
+Summary of all 3 issues:
+
+#	Bug	Severity	Fixed
+1	loss_ce + lambda * None crashes when batch has no proto tokens	crash	✓
+2	Stale _last_proto_Z from previous step used silently	silent wrong loss	✓
+3	loss_lvr field reused for prototype aux loss in wandb logs	cosmetic / confusing	left as-is, just naming
+The loss formulas themselves (L_div, L_focus) are mathematically correct. The sim[:, off_diag] indexing is valid PyTorch (gives [B, K*(K-1)]) and the entropy formula correctly minimises to peaked attention.
+
+
+
+
+Run it with:
+
+
+make train-stage1-3b
+What changed vs the old script:
+
+Setting	Old	New	Why
+DeepSpeed	zero3_offload (CPU offload)	zero2.json	No CPU transfer, both GPUs stay busy
+Flash Attention	disabled	enabled	~2× throughput on L40S
+Batch per device	1	2	Fills GPU VRAM properly
+Grad accum	4	4	Effective batch 16 (was 8)
+Packed tokens	8192 (2×4096)	16384 (4×4096)	More data per step
+dataloader workers	2	4	Keep data pipeline fed
+NCCL / master addr	missing	added	Stable multi-GPU comms
+Why ZeRO-2 instead of ZeRO-3 here: This is the regular train_lvr.py (no prototype), 3B model on 2×46 GB. ZeRO-2 shards only optimizer states — each GPU keeps the full model, so forward/backward never needs to gather params across GPUs. Much lower communication overhead for 2-GPU setup.
+
+If you see OOM, drop back to BATCH_PER_DEVICE=1 or MAX_INSTANCE_PER_BATCH=2 first. 

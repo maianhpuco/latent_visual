@@ -1,8 +1,9 @@
 import os
+import json
 import torch
 import torch.nn as nn
 import wandb
-from transformers import Trainer
+from transformers import Trainer, TrainerCallback
 from transformers.trainer import (
     is_sagemaker_mp_enabled,
     get_parameter_names,
@@ -14,6 +15,26 @@ from transformers.trainer import (
 )
 
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
+
+class DIMVCheckpointCallback(TrainerCallback):
+    """
+    Saves scheduled DIMV checkpoints and runs V* validation on rank 0.
+    """
+    def __init__(self, trainer_ref):
+        self.trainer_ref = trainer_ref
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if getattr(self.trainer_ref.model, 'latent_reasoning', None) is None:
+            return
+        if getattr(args, 'validate_every_n_steps', 0) <= 0:
+            return
+        if not getattr(args, 'should_save', False):
+            return
+        step = state.global_step
+        if self.trainer_ref._should_checkpoint(step):
+            ckpt_path = self.trainer_ref._save_dimv_checkpoint(step)
+            self.trainer_ref._validate_on_vstar(step, ckpt_path)
+
 
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
@@ -33,10 +54,30 @@ class QwenLVRSFTTrainer(Trainer):
 
     def __init__(self, *args, temp_folder=None, oci_handler=None, **kwargs):
         super(QwenLVRSFTTrainer, self).__init__(*args, **kwargs)
+        # This trainer implements its own compute_loss and does not use
+        # Hugging Face's num_items_in_batch token-count scaling. Mark that
+        # explicitly so Trainer.get_batch_samples does not try to gather a CPU
+        # scalar before packed batches are moved onto CUDA.
+        self.model_accepts_loss_kwargs = False
+        if getattr(self.args, "average_tokens_across_devices", False):
+            logger.info(
+                "[LVRTrainer] Disabling average_tokens_across_devices because "
+                "custom compute_loss ignores num_items_in_batch."
+            )
+            self.args.average_tokens_across_devices = False
         # if online checkpointing
         if oci_handler:
             self.oci_handler = oci_handler
             self.temp_folder = temp_folder     # temp_file class; "/dockerx/Local/users/bangzheng/model_name/run_name-[random]"
+        # DIMV-ROI: register checkpoint/validation callback
+        self._last_logged_loss = 0.0
+        self._last_logged_loss_ntp = 0.0
+        self._last_logged_loss_imp = 0.0
+        if (
+            getattr(self.model, 'latent_reasoning', None) is not None
+            and getattr(self.args, 'validate_every_n_steps', 0) > 0
+        ):
+            self.add_callback(DIMVCheckpointCallback(self))
 
     def create_optimizer(self):
         """
@@ -67,8 +108,27 @@ class QwenLVRSFTTrainer(Trainer):
                 lr_mapper["lvr_head"] = self.args.lvr_head_lr
                 lvr_head_parameters = [name for name, _ in opt_model.named_parameters() if "lvr_head" in name]
 
+            prototype_parameters = []
+            if getattr(self.args, 'prototype_lr', None) is not None:
+                lr_mapper["prototype"] = self.args.prototype_lr
+                prototype_parameters = [
+                    name for name, _ in opt_model.named_parameters()
+                    if "prototype_bank" in name or "prototype_cross_attn" in name
+                ]
+
+            latent_reasoning_parameters = []
+            if getattr(self.args, 'latent_reasoning_lr', None) is not None:
+                lr_mapper["latent_reasoning"] = self.args.latent_reasoning_lr
+                latent_reasoning_parameters = [
+                    name for name, _ in opt_model.named_parameters()
+                    if "latent_reasoning" in name or "roi_pooler" in name
+                ]
+
             if len(lr_mapper) > 0:
-                special_lr_parameters = merger_parameters + visual_parameters + lvr_head_parameters
+                special_lr_parameters = (
+                    merger_parameters + visual_parameters + lvr_head_parameters
+                    + prototype_parameters + latent_reasoning_parameters
+                )
                 
                 optimizer_grouped_parameters = [
                     {
@@ -113,7 +173,7 @@ class QwenLVRSFTTrainer(Trainer):
                         ]
                     )
                 
-                if lvr_head_parameters: 
+                if lvr_head_parameters:
                     optimizer_grouped_parameters.extend(
                         [
                             {
@@ -125,6 +185,42 @@ class QwenLVRSFTTrainer(Trainer):
                                 "params": [p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n in lvr_head_parameters and p.requires_grad)],
                                 "weight_decay": 0.0,
                                 "lr": self.args.lvr_head_lr,
+                            },
+                        ]
+                    )
+
+                if prototype_parameters:
+                    optimizer_grouped_parameters.extend(
+                        [
+                            {
+                                "params": [p for n, p in opt_model.named_parameters() if (n in decay_parameters and n in prototype_parameters and p.requires_grad)],
+                                "weight_decay": self.args.weight_decay,
+                                "lr": self.args.prototype_lr,
+                                "name": "prototype",
+                            },
+                            {
+                                "params": [p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n in prototype_parameters and p.requires_grad)],
+                                "weight_decay": 0.0,
+                                "lr": self.args.prototype_lr,
+                                "name": "prototype_no_decay",
+                            },
+                        ]
+                    )
+
+                if latent_reasoning_parameters:
+                    optimizer_grouped_parameters.extend(
+                        [
+                            {
+                                "params": [p for n, p in opt_model.named_parameters() if (n in decay_parameters and n in latent_reasoning_parameters and p.requires_grad)],
+                                "weight_decay": self.args.weight_decay,
+                                "lr": self.args.latent_reasoning_lr,
+                                "name": "latent_reasoning",
+                            },
+                            {
+                                "params": [p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n in latent_reasoning_parameters and p.requires_grad)],
+                                "weight_decay": 0.0,
+                                "lr": self.args.latent_reasoning_lr,
+                                "name": "latent_reasoning_no_decay",
                             },
                         ]
                     )
@@ -207,7 +303,7 @@ class QwenLVRSFTTrainer(Trainer):
             self._push_from_checkpoint(output_dir)
 
         # output_dir is local; now we save to cloud if needed
-        if self.temp_folder:
+        if getattr(self, 'temp_folder', None):
             remote_chkpt_folder = os.path.join(self.args.remote_output_dir,checkpoint_folder)
             if remote_chkpt_folder[0] == '/':
                 remote_chkpt_folder = remote_chkpt_folder[1:]       #remote pathing rules will take bucket//checkpoints, need to remove the dup
@@ -232,7 +328,6 @@ class QwenLVRSFTTrainer(Trainer):
             "tokens_per_device": total_tokens,})
 
         outputs = model(**inputs)
-        # loss = outputs.loss  # total loss
         loss_ce = outputs.loss_ce
         loss_lvr = outputs.loss_lvr
         loss_mode_switch = outputs.loss_mode_switch
@@ -240,15 +335,157 @@ class QwenLVRSFTTrainer(Trainer):
         if self.args.mode_switch_loss:
             loss = loss_ce + self.args.loss_lvr_lambda * loss_lvr + self.args.loss_mode_switch_lambda * loss_mode_switch
         else:
-            loss = loss_ce + self.args.loss_lvr_lambda * loss_lvr if self.args.loss_lvr_lambda > 0 else loss_ce
+            # Guard: loss_lvr is None when prototype_mode forward finds no proto tokens in batch
+            if self.args.loss_lvr_lambda > 0 and loss_lvr is not None:
+                loss = loss_ce + self.args.loss_lvr_lambda * loss_lvr
+            else:
+                loss = loss_ce
+
+        # ── DIMV-ROI: add imputation loss ─────────────────────────────────
+        loss_imp = torch.tensor(0.0, device=loss_ce.device)
+        if (getattr(self.args, 'use_roi_supervision', False)
+                and getattr(model, 'roi_pooler', None) is not None
+                and getattr(model, '_last_Z_final', None) is not None
+                and getattr(model, '_last_Z_roi_target', None) is not None):
+            from src.model.latent_reasoning_module import compute_imputation_loss
+            loss_imp = compute_imputation_loss(
+                Z_final=model._last_Z_final,
+                Z_roi_target=model._last_Z_roi_target,
+                loss_type=getattr(self.args, 'imputation_loss_type', 'cosine'),
+                temperature=getattr(self.args, 'nce_temperature', 0.07),
+            )
+            lam = getattr(self.args, 'imputation_loss_lambda', 0.1)
+            loss = loss + lam * loss_imp
+        # ── END DIMV-ROI ──────────────────────────────────────────────────
 
         # Log each component
-        self.log({
+        log_dict = {
             "loss_total": loss.detach().item(),
             "loss_ce": loss_ce.detach().item(),
             "loss_lvr": loss_lvr.detach().item() if loss_lvr is not None else 0.0,
             "loss_mode_switch": loss_mode_switch.detach().item() if loss_mode_switch is not None else 0.0,
-        })
+            "loss_imp": loss_imp.detach().item(),
+        }
+        self._last_logged_loss = loss.detach().item()
+        self._last_logged_loss_ntp = loss_ce.detach().item()
+        self._last_logged_loss_imp = loss_imp.detach().item()
 
+        # Log DIMV slot attention entropy (collapse detection for latent reasoning slots)
+        _slot_A = getattr(model, '_last_slot_attn_weights', None)
+        if _slot_A is not None:
+            import torch.nn.functional as _F
+            _eps = 1e-9
+            _slot_entropy = -(_slot_A.float() * (_slot_A.float() + _eps).log()).sum(dim=-1).mean().item()
+            log_dict["dimv_slot_attn_entropy"] = _slot_entropy
+
+        # Log prototype-specific diagnostics (slot collapse detection)
+        _Z = getattr(model, '_last_proto_Z', None)
+        _A = getattr(model, '_last_proto_attn_weights', None)
+        if _Z is not None and _A is not None:
+            import torch.nn.functional as _F
+            _Z_norm = _F.normalize(_Z.float(), dim=-1)
+            _sim = torch.bmm(_Z_norm, _Z_norm.transpose(1, 2))
+            _K = _Z.shape[1]
+            _off_diag = ~torch.eye(_K, dtype=torch.bool, device=_Z.device)
+            _mean_cos = _sim[:, _off_diag].abs().mean().item()
+            _eps = 1e-9
+            _entropy = -(_A.float() * (_A.float() + _eps).log()).sum(dim=-1).mean().item()
+            log_dict["mean_cosine_sim"] = _mean_cos
+            log_dict["mean_proto_entropy"] = _entropy
+            if _mean_cos > 0.8:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    f"[Prototype] Slot collapse detected! mean_cosine_sim={_mean_cos:.3f}. "
+                    "Consider increasing loss_diversity_lambda or reducing prototype_lr."
+                )
+
+        self.log(log_dict)
 
         return (loss, outputs) if return_outputs else loss
+
+    # ── DIMV-ROI checkpoint and validation helpers ────────────────────────
+
+    def _should_checkpoint(self, step: int) -> bool:
+        early_raw = getattr(self.args, 'early_checkpoint_steps', '10,100') or '10,100'
+        if isinstance(early_raw, str):
+            early_steps = [int(s) for s in early_raw.split(',') if s.strip()]
+        elif isinstance(early_raw, (list, tuple)):
+            early_steps = [int(s) for s in early_raw]
+        else:
+            early_steps = [10, 100]
+        validate_every = getattr(self.args, 'validate_every_n_steps', 500)
+        max_steps = getattr(self.args, 'max_steps', 2500)
+        return step in early_steps or (step > 0 and step % validate_every == 0) or step == max_steps
+
+    def _save_dimv_checkpoint(self, step: int) -> str:
+        ckpt_path = os.path.join(self._get_output_dir(trial=None), f"{PREFIX_CHECKPOINT_DIR}-{step}")
+        if os.path.isdir(ckpt_path):
+            print(f"[DIMV] Checkpoint already exists: {ckpt_path}")
+            return ckpt_path
+        self._save_checkpoint(self.model, trial=None)
+        print(f"[DIMV] Checkpoint saved: {ckpt_path}")
+        return ckpt_path
+
+    def _validate_on_vstar(self, step: int, ckpt_path: str) -> dict:
+        checkpoint_dir = getattr(self.args, 'checkpoint_dir_roi', None) or self.args.output_dir
+        val_indices_path = os.path.join(checkpoint_dir, "vstar_val_indices.json")
+        val_results_dir = os.path.join(checkpoint_dir, "val_results")
+        os.makedirs(val_results_dir, exist_ok=True)
+
+        try:
+            from src.eval.vstar_validator import VStarValidator
+        except ImportError:
+            print("[DIMV] VStarValidator not found. Skipping validation.")
+            return {}
+
+        if os.path.exists(val_indices_path):
+            with open(val_indices_path, "r") as f:
+                val_indices = json.load(f)
+        else:
+            val_indices = VStarValidator.create_fixed_val_set(
+                val_fraction=getattr(self.args, 'vstar_val_fraction', 0.30),
+                seed=getattr(self.args, 'vstar_val_seed', 42),
+                save_path=val_indices_path,
+                configs_dir=getattr(self.args, 'vstar_configs_dir', None),
+            )
+
+        print(f"[DIMV] Running v*star validation: {len(val_indices)} samples at step {step} ...")
+
+        device = next(self.model.parameters()).device
+        validator = VStarValidator(
+            model=self.model,
+            processor=getattr(self, 'processing_class', None) or getattr(self, 'tokenizer', None),
+            val_indices=val_indices,
+            device=device,
+            configs_dir=getattr(self.args, 'vstar_configs_dir', None),
+            max_new_tokens=getattr(self.args, 'vstar_max_new_tokens', 32),
+        )
+        try:
+            metrics = validator.evaluate()
+        except NotImplementedError:
+            print("[DIMV] VStarValidator._eval_batch() not implemented. Skipping validation.")
+            metrics = {"accuracy": 0.0, "n_correct": 0, "n_samples": len(val_indices), "per_sample": []}
+
+        result_record = {
+            "step": step,
+            "checkpoint_path": ckpt_path,
+            "train_loss": self._last_logged_loss,
+            "train_loss_ntp": self._last_logged_loss_ntp,
+            "train_loss_imp": self._last_logged_loss_imp,
+            "val_accuracy": metrics.get("accuracy", 0.0),
+            "val_n_correct": metrics.get("n_correct", 0),
+            "val_n_samples": metrics.get("n_samples", 0),
+            "per_sample": metrics.get("per_sample", []),
+        }
+        result_path = os.path.join(val_results_dir, f"step_{step}.json")
+        with open(result_path, "w") as f:
+            json.dump(result_record, f, indent=2, ensure_ascii=False)
+
+        self.log({
+            "val/accuracy": metrics.get("accuracy", 0.0),
+            "val/n_correct": metrics.get("n_correct", 0),
+            "val/n_samples": metrics.get("n_samples", 0),
+        })
+        print(f"[DIMV] Step {step} | val_accuracy={metrics.get('accuracy', 0):.4f}")
+        print(f"[DIMV] Results saved → {result_path}")
+        return metrics

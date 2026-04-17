@@ -88,15 +88,666 @@ def _get_rope_index_compat(model, input_ids, image_grid_thw, video_grid_thw,
         )
 
 
+def build_observed_context(
+    image_embeds: torch.Tensor,   # [N_v, D]
+    text_embeds: torch.Tensor,    # [N_c, D]
+) -> torch.Tensor:
+    """
+    Build O = concat(V, C) as [1, N_v+N_c, D].
+
+    O is what the prototype cross-attention is conditioned on.
+    It must NOT contain any z_k values — prototypes are inferred FROM O.
+    """
+    O = torch.cat([image_embeds, text_embeds], dim=0)  # [N_v+N_c, D]
+    return O.unsqueeze(0)                               # [1, N_v+N_c, D]
+
+
+def inject_prototypes_into_sequence(
+    model,
+    inputs_embeds: torch.Tensor,   # [B, seq_len, D]
+    input_ids: torch.Tensor,        # [B, seq_len]
+    image_embeds_b: torch.Tensor,   # [N_v, D] for batch item b
+    text_embeds_b: torch.Tensor,    # [N_c, D] for batch item b
+    batch_idx: int,
+):
+    """
+    Run parallel prototype inference and inject all K results into
+    inputs_embeds at the [proto_k] token positions.
+
+    Returns:
+        inputs_embeds: modified in-place with Z injected.
+        attn_weights:  [K, N_obs] for loss computation.
+        Z:             [K, D] prototype vectors.
+    """
+    O = build_observed_context(image_embeds_b, text_embeds_b)  # [1, N_v+N_c, D]
+    P = model.prototype_bank()                                  # [K, D]
+
+    # Parallel inference: all K prototypes in ONE forward pass
+    Z, attn_weights = model.prototype_cross_attn(P=P, O=O)
+    Z = Z.squeeze(0)            # [K, D]
+    attn_weights = attn_weights.squeeze(0)  # [K, N_obs]
+
+    # Find [proto_k] positions in the sequence for this batch item
+    proto_positions = []
+    for k, tok_id in enumerate(model.proto_token_ids):
+        positions = (input_ids[batch_idx] == tok_id).nonzero(as_tuple=True)[0]
+        if len(positions) > 0:
+            proto_positions.append((k, positions[0].item()))
+
+    # Inject all K prototype vectors simultaneously
+    if proto_positions:
+        ks = torch.tensor([k for k, _ in proto_positions], device=Z.device)
+        seq_pos = torch.tensor([s for _, s in proto_positions], device=Z.device)
+        inputs_embeds[batch_idx, seq_pos] = Z[ks].to(inputs_embeds.dtype)
+
+    return inputs_embeds, attn_weights, Z
+
+
+def qwen2_5_mixed_modality_forward_prototype(
+    self,
+    input_ids: torch.LongTensor = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[List[torch.FloatTensor]] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    labels: Optional[torch.LongTensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+    pixel_values: Optional[torch.Tensor] = None,
+    pixel_values_videos: Optional[torch.FloatTensor] = None,
+    image_grid_thw: Optional[torch.LongTensor] = None,
+    video_grid_thw: Optional[torch.LongTensor] = None,
+    rope_deltas: Optional[torch.LongTensor] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    second_per_grid_ts: Optional[torch.Tensor] = None,
+    # Original LVR fields (unused in prototype mode, kept for interface compat)
+    lvr_tokens: Optional[torch.Tensor] = None,
+    lvr_tokens_thw: Optional[List[torch.Tensor]] = None,
+    lvr_mode_switch: Optional[torch.Tensor] = None,
+    last_position_hidden_state: Optional[torch.FloatTensor] = None,
+) -> Union[Tuple, "Qwen2_5_VLCausalLMOutputWithPast"]:
+    """
+    Prototype-based parallel LVR forward pass.
+
+    Replaces sequential [lvr] token injection with K independent prototype
+    slots computed via cross-attention: z_k = g_φ(p_k, O), ∂z_k/∂z_j = 0.
+    """
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_hidden_states = (
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    )
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    if inputs_embeds is None:
+        inputs_embeds = self.model.get_input_embeddings()(input_ids)
+
+    # Reset per-step prototype state so stale values from a previous batch are never used
+    self._last_proto_Z = None
+    self._last_proto_attn_weights = None
+
+    # Handle text-only batches (no pixel values) — dummy visual pass for DeepSpeed ZeRO-3
+    if pixel_values is None and pixel_values_videos is None:
+        dummy_pixel = torch.zeros(784, 1176).to(self.model.visual.device)
+        dummy_grid = torch.tensor([[1, 28, 28]]).to(self.model.visual.device)
+        dummy_pixel = dummy_pixel.type(self.model.visual.dtype)
+        dummy_image_embeds = self.model.visual(dummy_pixel, grid_thw=dummy_grid)
+        inputs_embeds = inputs_embeds + dummy_image_embeds.mean() * 0
+
+    batch_size = inputs_embeds.shape[0]
+    image_embeds_all = None  # will be set if pixel_values present
+
+    if pixel_values is not None:
+        image_embeds_all = self.model.get_image_features(pixel_values, image_grid_thw)
+        image_embeds_all = torch.cat(_extract_image_embeds(image_embeds_all), dim=0)
+
+        n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
+        n_image_features = image_embeds_all.shape[0]
+        if n_image_tokens != n_image_features:
+            raise ValueError(
+                f"Image features and image tokens do not match: "
+                f"tokens: {n_image_tokens}, features {n_image_features}"
+            )
+
+        image_mask = input_ids == self.config.image_token_id  # [B, seq_len]
+        image_mask_unsqueeze = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        image_embeds_all = image_embeds_all.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask_unsqueeze, image_embeds_all)
+
+        # Per-sample: build observed context O and inject prototype vectors Z
+        all_attn_weights = []
+        all_Z = []
+        total_tokens = torch.sum(image_mask, dim=1)  # [B]: #image tokens per sample
+        image_token_offsets = torch.cumsum(
+            F.pad(total_tokens, (1, 0)), dim=0
+        )[:-1]  # [B]: global offset into image_embeds_all for each sample
+
+        # Build a mask for proto token positions (any [proto_k])
+        proto_any_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        if self.proto_token_ids is not None:
+            for tok_id in self.proto_token_ids:
+                proto_any_mask |= (input_ids == tok_id)
+
+        for b in range(batch_size):
+            # Extract visual embeddings for sample b
+            offset = image_token_offsets[b].item()
+            n_vis = total_tokens[b].item()
+            image_embeds_b = image_embeds_all[offset: offset + n_vis]  # [N_v, D]
+
+            # Extract text embeddings: non-image, non-proto positions
+            text_mask_b = ~image_mask[b] & ~proto_any_mask[b]  # [seq_len]
+            text_embeds_b = inputs_embeds[b][text_mask_b]       # [N_c, D]
+
+            if self.proto_token_ids is not None and len(self.proto_token_ids) > 0:
+                inputs_embeds, attn_w, Z = inject_prototypes_into_sequence(
+                    model=self,
+                    inputs_embeds=inputs_embeds,
+                    input_ids=input_ids,
+                    image_embeds_b=image_embeds_b,
+                    text_embeds_b=text_embeds_b,
+                    batch_idx=b,
+                )
+                all_attn_weights.append(attn_w)
+                all_Z.append(Z)
+
+        if all_attn_weights:
+            self._last_proto_attn_weights = torch.stack(all_attn_weights, dim=0)  # [B, K, N_obs]
+            self._last_proto_Z = torch.stack(all_Z, dim=0)                        # [B, K, D]
+
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(inputs_embeds.device)
+
+    if position_ids is None:
+        prefill_compiled_stage = is_torchdynamo_compiling() and (
+            (input_ids is not None and input_ids.shape[1] != 1)
+            or (inputs_embeds is not None and inputs_embeds.shape[1] != 1)
+        )
+        prefill_noncompiled_stage = not is_torchdynamo_compiling() and (
+            (cache_position is not None and cache_position[0] == 0)
+            or (past_key_values is None or past_key_values.get_seq_length() == 0)
+        )
+        if (prefill_compiled_stage or prefill_noncompiled_stage) or self.model.rope_deltas is None:
+            position_ids, rope_deltas = _get_rope_index_compat(
+                self.model, input_ids, image_grid_thw, video_grid_thw,
+                second_per_grid_ts, attention_mask, self.config,
+            )
+            self.model.rope_deltas = rope_deltas
+        else:
+            batch_size_inner, seq_length, _ = inputs_embeds.shape
+            position_ids = torch.arange(seq_length, device=inputs_embeds.device)
+            position_ids = position_ids.view(1, 1, -1).expand(3, batch_size_inner, -1)
+            if cache_position is not None:
+                delta = (cache_position[0] + self.model.rope_deltas).to(inputs_embeds.device)
+            else:
+                delta = torch.zeros((batch_size_inner, seq_length), device=inputs_embeds.device)
+            delta = delta.repeat_interleave(batch_size_inner // delta.shape[0], dim=1)
+            position_ids += delta.to(position_ids.device)
+
+    outputs = self.model.language_model(
+        input_ids=None,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=return_dict,
+        cache_position=cache_position,
+    )
+
+    hidden_states = outputs[0]
+    last_position_hidden_state = outputs.last_hidden_state[:, -1, :]
+    logits = self.lm_head(hidden_states)
+
+    loss_ce = None
+    loss_proto = None
+
+    if labels is not None:
+        logits_f = logits.float()
+        shift_logits = logits_f[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        # Mask out [proto_k] token positions from CE loss
+        if self.proto_token_ids is not None:
+            for tok_id in self.proto_token_ids:
+                shift_labels = shift_labels.masked_fill(shift_labels == tok_id, IGNORE_INDEX)
+
+        loss_fct = CrossEntropyLoss()
+        shift_logits = shift_logits.view(-1, shift_logits.shape[-1])
+        shift_labels = shift_labels.view(-1).to(shift_logits.device)
+        loss_ce = loss_fct(shift_logits, shift_labels)
+
+        # Prototype auxiliary losses (diversity + focus)
+        if self._last_proto_Z is not None and self._last_proto_attn_weights is not None:
+            proto_cfg = getattr(self.config, 'prototype_config', None)
+            lambda_div   = proto_cfg.loss_diversity_lambda if proto_cfg else 0.05
+            lambda_focus = proto_cfg.loss_focus_lambda     if proto_cfg else 0.01
+
+            Z_f = self._last_proto_Z.float()
+            A_f = self._last_proto_attn_weights.float()
+
+            # L_div: mean squared cosine similarity between all prototype pairs
+            Z_norm = F.normalize(Z_f, dim=-1)         # [B, K, D]
+            sim = torch.bmm(Z_norm, Z_norm.transpose(1, 2))  # [B, K, K]
+            K = Z_f.shape[1]
+            off_diag = ~torch.eye(K, dtype=torch.bool, device=Z_f.device)
+            loss_div = (sim[:, off_diag] ** 2).mean()
+
+            # L_focus: mean attention entropy
+            eps = 1e-9
+            entropy = -(A_f * (A_f + eps).log()).sum(dim=-1)  # [B, K]
+            loss_focus = entropy.mean()
+
+            loss_proto = lambda_div * loss_div + lambda_focus * loss_focus
+
+    if not return_dict:
+        output = (logits,) + outputs[1:]
+        return (loss_ce,) + output if loss_ce is not None else output
+
+    return Qwen2_5_VLCausalLMOutputWithPast(
+        loss_ce=loss_ce,
+        loss_lvr=loss_proto,          # reuse loss_lvr field for proto aux loss
+        loss_mode_switch=None,
+        logits=logits,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+        rope_deltas=self.model.rope_deltas,
+        last_position_hidden_state=last_position_hidden_state,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DIMV-style latent reasoning forward pass
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _build_dimv_4d_mask(
+    input_ids: torch.Tensor,    # [B, seq_len]
+    image_token_id: int,
+    slot_token_ids: list,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Build a [B, 1, seq_len, seq_len] additive float attention mask that:
+      - Enforces causal order for all positions.
+      - Blocks Y (answer tokens, after the last slot token) from attending
+        to V (image patch tokens) — this is the bottleneck.
+      - Z (slot tokens) can attend to everything before them (causal).
+
+    Values: 0.0 = allowed, float('-inf') = blocked.
+    The mask is passed directly to Qwen2_5_VLTextModel; transformers 4.57
+    returns any 4-D mask as-is from _preprocess_mask_arguments.
+    """
+    B, seq_len = input_ids.shape
+
+    # Start with a standard causal mask: upper-triangle = -inf
+    causal = torch.triu(
+        torch.full((seq_len, seq_len), float('-inf'), dtype=dtype, device=device),
+        diagonal=1,
+    )  # [seq_len, seq_len]
+
+    # Expand to [B, 1, seq_len, seq_len] (broadcast over num_heads)
+    mask = causal.unsqueeze(0).unsqueeze(0).expand(B, 1, seq_len, seq_len).clone()
+
+    for b in range(B):
+        # V positions: image placeholder tokens
+        v_pos = (input_ids[b] == image_token_id).nonzero(as_tuple=True)[0]
+        if len(v_pos) == 0:
+            continue
+
+        # Z positions: all slot tokens
+        slot_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        for sid in slot_token_ids:
+            slot_mask |= (input_ids[b] == sid)
+        z_pos = slot_mask.nonzero(as_tuple=True)[0]
+        if len(z_pos) == 0:
+            continue
+
+        # Y positions: everything AFTER the last slot token
+        last_z = z_pos[-1].item()
+        if last_z + 1 >= seq_len:
+            continue
+        y_pos = torch.arange(last_z + 1, seq_len, device=device)
+
+        # Block Y → V: answer tokens cannot attend to image patches
+        mask[b, 0][y_pos.unsqueeze(1), v_pos.unsqueeze(0)] = float('-inf')
+
+    return mask  # [B, 1, seq_len, seq_len]
+
+
+def _extract_observed_context(
+    inputs_embeds: torch.Tensor,   # [B, seq_len, d]
+    input_ids: torch.Tensor,        # [B, seq_len]
+    slot_token_ids: list,
+) -> tuple:
+    """
+    Extract X_o = all embeddings except slot positions.
+
+    X_o is the "observed" set in DIMV terminology: it contains V (image patches)
+    and x_txt (text tokens), but NOT the Z slots (those are the missing variables).
+
+    Returns:
+        X_o_batch:    [B, N_obs_max, d], zero-padded to the longest sample.
+        key_pad_mask: [B, N_obs_max] bool, True at padding positions.
+    """
+    B, seq_len, d = inputs_embeds.shape
+    device = inputs_embeds.device
+    dtype = inputs_embeds.dtype
+
+    all_X_o = []
+    for b in range(B):
+        slot_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        for sid in slot_token_ids:
+            slot_mask |= (input_ids[b] == sid)
+        obs_mask = ~slot_mask  # everything that is NOT a slot token
+        all_X_o.append(inputs_embeds[b][obs_mask])  # [N_obs_b, d]
+
+    N_max = max(x.shape[0] for x in all_X_o)
+    X_o_batch = torch.zeros(B, N_max, d, device=device, dtype=dtype)
+    key_pad_mask = torch.ones(B, N_max, dtype=torch.bool, device=device)
+
+    for b, x in enumerate(all_X_o):
+        n = x.shape[0]
+        X_o_batch[b, :n] = x
+        key_pad_mask[b, :n] = False  # False = not padding
+
+    return X_o_batch, key_pad_mask
+
+
+def _inject_z_into_embeds(
+    inputs_embeds: torch.Tensor,   # [B, seq_len, d] — modified in-place
+    input_ids: torch.Tensor,        # [B, seq_len]
+    Z_final: torch.Tensor,          # [B, T_v, d]
+    slot_token_ids: list,           # list of T_v token IDs in order
+) -> torch.Tensor:
+    """
+    Replace [SLOT_k] placeholder embeddings with Z_final[b, k] for all b, k.
+    Operates in-place on inputs_embeds.
+    """
+    B = Z_final.shape[0]
+    for b in range(B):
+        for k, sid in enumerate(slot_token_ids):
+            positions = (input_ids[b] == sid).nonzero(as_tuple=True)[0]
+            if len(positions) > 0:
+                inputs_embeds[b, positions[0].item()] = Z_final[b, k].to(inputs_embeds.dtype)
+    return inputs_embeds
+
+
+def qwen2_5_mixed_modality_forward_dimv(
+    self,
+    input_ids: torch.LongTensor = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[List[torch.FloatTensor]] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    labels: Optional[torch.LongTensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+    pixel_values: Optional[torch.Tensor] = None,
+    pixel_values_videos: Optional[torch.FloatTensor] = None,
+    image_grid_thw: Optional[torch.LongTensor] = None,
+    video_grid_thw: Optional[torch.LongTensor] = None,
+    rope_deltas: Optional[torch.LongTensor] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    second_per_grid_ts: Optional[torch.Tensor] = None,
+    # Original LVR fields — unused in DIMV mode, kept for interface compat
+    lvr_tokens: Optional[torch.Tensor] = None,
+    lvr_tokens_thw: Optional[List[torch.Tensor]] = None,
+    lvr_mode_switch: Optional[torch.Tensor] = None,
+    last_position_hidden_state: Optional[torch.FloatTensor] = None,
+    # Absorb extra kwargs from the standard transformers generate loop
+    # (e.g. cu_seq_lens_q passed by flash-attn 2 during decode steps)
+    **kwargs: Unpack[TransformersKwargs],
+) -> Union[Tuple, "Qwen2_5_VLCausalLMOutputWithPast"]:
+    """
+    DIMV-style latent reasoning forward pass.
+
+    Sequence layout (per sample):
+        [x_txt | V | Z | Y]
+         text    img  slots  answer
+
+    Bottleneck: a custom 4D attention mask blocks Y from attending to V.
+    All visual information that helps predict Y must pass through Z.
+    Loss: NTP cross-entropy on Y tokens only (labels mask all other positions).
+
+    Z is computed in parallel by LatentReasoningModule:
+        X_o = concat(V, x_txt)   (all non-slot embeddings)
+        Z   = LatentReasoningModule(X_o)   [B, T_v, d]
+    """
+    output_attentions = output_attentions if output_attentions is not None \
+        else self.config.output_attentions
+    output_hidden_states = output_hidden_states if output_hidden_states is not None \
+        else self.config.output_hidden_states
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    if inputs_embeds is None:
+        inputs_embeds = self.model.get_input_embeddings()(input_ids)
+
+    # Reset per-step DIMV state
+    self._last_slot_attn_weights = None
+
+    # ── Dummy visual pass for DeepSpeed ZeRO-3 when no image in batch ────
+    if pixel_values is None and pixel_values_videos is None:
+        dummy_pixel = torch.zeros(784, 1176, device=self.model.visual.device,
+                                  dtype=self.model.visual.dtype)
+        dummy_grid  = torch.tensor([[1, 28, 28]], device=self.model.visual.device)
+        dummy_embeds = self.model.visual(dummy_pixel, grid_thw=dummy_grid)
+        inputs_embeds = inputs_embeds + dummy_embeds.mean() * 0
+
+    # ── Inject image patch embeddings into inputs_embeds ─────────────────
+    if pixel_values is not None:
+        image_embeds = self.model.get_image_features(pixel_values, image_grid_thw)
+        image_embeds = torch.cat(_extract_image_embeds(image_embeds), dim=0)
+
+        n_img_tokens   = (input_ids == self.config.image_token_id).sum().item()
+        n_img_features = image_embeds.shape[0]
+        if n_img_tokens != n_img_features:
+            raise ValueError(
+                f"DIMV: image token count mismatch: "
+                f"tokens={n_img_tokens}, features={n_img_features}"
+            )
+
+        img_mask = (input_ids == self.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+        image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(img_mask.to(inputs_embeds.device), image_embeds)
+
+    # ── Compute Z via LatentReasoningModule and inject at slot positions ──
+    if (self.latent_reasoning is not None
+            and self.slot_token_ids is not None
+            and pixel_values is not None):
+
+        # X_o = all embeddings except slot placeholders [B, N_obs, d]
+        X_o, key_pad_mask = _extract_observed_context(
+            inputs_embeds, input_ids, self.slot_token_ids
+        )
+
+        # Optional warm-start: last observed token hidden state
+        last_hidden = (inputs_embeds[:, -1, :]
+                       if self.latent_reasoning.slot_init == "last_hidden"
+                       else None)
+
+        # Parallel imputation: all T_v slots from X_o simultaneously
+        Z_final, attn_weights = self.latent_reasoning(
+            X_o=X_o,
+            last_hidden=last_hidden,
+            key_padding_mask=key_pad_mask,
+        )
+        # Z_final: [B, T_v, d];  attn_weights: [B, T_v, N_obs]
+
+        self._last_slot_attn_weights = attn_weights.detach()
+
+        # Replace [SLOT_k] placeholder embeddings with Z^(final)_k
+        inputs_embeds = _inject_z_into_embeds(
+            inputs_embeds, input_ids, Z_final, self.slot_token_ids
+        )
+
+        # ── DIMV-ROI: extract V_ROI* and store for L_IMP ─────────────────
+        if (getattr(self, 'roi_pooler', None) is not None
+                and lvr_tokens is not None
+                and len(lvr_tokens) > 0):
+            B = input_ids.shape[0]
+            # Number of visual tokens per sample: T*(H//2)*(W//2)
+            tokens_per_sample = [
+                int(thw[0].item()) * (int(thw[1].item()) // 2) * (int(thw[2].item()) // 2)
+                for thw in image_grid_thw
+            ]
+            image_embeds_split = list(torch.split(image_embeds, tokens_per_sample))
+
+            roi_embed_list = []
+            for b in range(B):
+                emb_b = image_embeds_split[b] if b < len(image_embeds_split) else None
+                tok = lvr_tokens[b] if b < len(lvr_tokens) else None
+                v_roi_b = None
+                if emb_b is not None and tok is not None:
+                    if isinstance(tok, torch.Tensor) and tok.numel() > 0:
+                        idx = tok.to(dtype=torch.long, device=emb_b.device)
+                        v_roi_b = emb_b[idx]
+                    elif hasattr(tok, '__len__') and len(tok) > 0:
+                        idx = torch.tensor(list(tok), dtype=torch.long, device=emb_b.device)
+                        v_roi_b = emb_b[idx]
+                if v_roi_b is None or v_roi_b.shape[0] == 0:
+                    v_roi_b = torch.zeros(0, image_embeds.shape[-1], device=image_embeds.device,
+                                          dtype=image_embeds.dtype)
+                roi_embed_list.append(v_roi_b)
+
+            # Pad variable-K to [B, K_max, d]
+            d_model = image_embeds.shape[-1]
+            K_max = max(max(v.shape[0] for v in roi_embed_list), 1)
+            V_roi_batch = torch.zeros(B, K_max, d_model,
+                                      device=image_embeds.device, dtype=image_embeds.dtype)
+            roi_pad_mask = torch.ones(B, K_max, dtype=torch.bool, device=image_embeds.device)
+            for b, v in enumerate(roi_embed_list):
+                if v.shape[0] > 0:
+                    V_roi_batch[b, :v.shape[0]] = v
+                    roi_pad_mask[b, :v.shape[0]] = False
+
+            Z_roi_target = self.roi_pooler(V_roi=V_roi_batch, roi_padding_mask=roi_pad_mask)
+            self._last_Z_final = Z_final
+            self._last_Z_roi_target = Z_roi_target
+        # ── END DIMV-ROI ──────────────────────────────────────────────────
+
+    # ── Build bottleneck attention mask ───────────────────────────────────
+    # Y cannot attend to V. This forces all visual information through Z.
+    dimv_mask = None
+    if (self.slot_token_ids is not None
+            and pixel_values is not None
+            and input_ids is not None):
+        dimv_mask = _build_dimv_4d_mask(
+            input_ids=input_ids,
+            image_token_id=self.config.image_token_id,
+            slot_token_ids=self.slot_token_ids,
+            dtype=inputs_embeds.dtype,
+            device=inputs_embeds.device,
+        )
+    else:
+        # No image or slots present — fall through to standard causal mask
+        if attention_mask is not None:
+            dimv_mask = attention_mask.to(inputs_embeds.device)
+
+    # ── RoPE position IDs ─────────────────────────────────────────────────
+    if position_ids is None:
+        prefill_compiled = is_torchdynamo_compiling() and (
+            (input_ids is not None and input_ids.shape[1] != 1)
+            or (inputs_embeds is not None and inputs_embeds.shape[1] != 1)
+        )
+        prefill_noncompiled = not is_torchdynamo_compiling() and (
+            (cache_position is not None and cache_position[0] == 0)
+            or (past_key_values is None or past_key_values.get_seq_length() == 0)
+        )
+        if prefill_compiled or prefill_noncompiled or self.model.rope_deltas is None:
+            position_ids, rope_deltas = _get_rope_index_compat(
+                self.model, input_ids, image_grid_thw, video_grid_thw,
+                second_per_grid_ts, attention_mask, self.config,
+            )
+            self.model.rope_deltas = rope_deltas
+        else:
+            B_inner, seq_len, _ = inputs_embeds.shape
+            position_ids = torch.arange(seq_len, device=inputs_embeds.device)
+            position_ids = position_ids.view(1, 1, -1).expand(3, B_inner, -1)
+            delta = (cache_position[0] + self.model.rope_deltas).to(inputs_embeds.device) \
+                if cache_position is not None \
+                else torch.zeros((B_inner, seq_len), device=inputs_embeds.device)
+            delta = delta.repeat_interleave(B_inner // delta.shape[0], dim=1)
+            position_ids = position_ids + delta.to(position_ids.device)
+
+    # ── LLM forward ───────────────────────────────────────────────────────
+    # Pass the bottleneck mask as attention_mask so transformers uses it
+    # directly (4-D tensors are returned as-is by _preprocess_mask_arguments)
+    outputs = self.model.language_model(
+        input_ids=None,
+        position_ids=position_ids,
+        attention_mask=dimv_mask,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=return_dict,
+        cache_position=cache_position,
+    )
+
+    hidden_states = outputs[0]
+    logits = self.lm_head(hidden_states)
+
+    # ── NTP loss on answer tokens only ────────────────────────────────────
+    # labels: IGNORE_INDEX for x_txt + V + Z positions, real IDs for Y.
+    # Slot tokens must also be masked in labels (they are by the dataset).
+    loss_ntp = None
+    if labels is not None:
+        logits_f = logits.float()
+        shift_logits = logits_f[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        # Extra guard: mask out any slot token IDs that leaked into labels
+        if self.slot_token_ids is not None:
+            for sid in self.slot_token_ids:
+                shift_labels = shift_labels.masked_fill(shift_labels == sid, IGNORE_INDEX)
+
+        loss_fct = CrossEntropyLoss()
+        loss_ntp = loss_fct(
+            shift_logits.view(-1, shift_logits.shape[-1]),
+            shift_labels.view(-1).to(shift_logits.device),
+        )
+
+    if not return_dict:
+        out = (logits,) + outputs[1:]
+        return (loss_ntp,) + out if loss_ntp is not None else out
+
+    return Qwen2_5_VLCausalLMOutputWithPast(
+        loss_ce=loss_ntp,       # NTP loss — only this is used by the trainer
+        loss_lvr=None,          # no auxiliary loss in DIMV
+        loss_mode_switch=None,
+        logits=logits,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+        rope_deltas=self.model.rope_deltas,
+        last_position_hidden_state=outputs.last_hidden_state[:, -1, :],
+    )
+
+
 def replace_qwen2_5_with_mixed_modality_forward_lvr(inference_mode=False,
                                                     coconut=True,
                                                     lvr_head=True,
                                                     mode_switch_loss=False,
                                                     latent_end_token=False,
-                                                    rl = False):
+                                                    rl=False,
+                                                    prototype_mode=False,
+                                                    dimv_mode=False):
     
     print("#"*42)
-    if inference_mode:
+    if dimv_mode:
+        print("Activated DIMV latent reasoning mode (NTP-only loss, bottleneck mask)!!!")
+        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLForConditionalGeneration.forward = qwen2_5_mixed_modality_forward_dimv
+    elif prototype_mode:
+        print("Activated prototype-based parallel LVR mode!!!")
+        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLForConditionalGeneration.forward = qwen2_5_mixed_modality_forward_prototype
+    elif inference_mode:
         if lvr_head:
             print("Inference mode with Lvr_head!!!")
             transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLForConditionalGeneration.forward = qwen2_5_mixed_modality_forward_lvr_with_head_inference
@@ -356,7 +1007,7 @@ def qwen2_5_mixed_modality_forward_lvr(
     last_position_hidden_state = outputs.last_hidden_state[:,-1,:]
     logits = self.lm_head(hidden_states)
 
-    lvr_loss_fct = set_lvr_loss_fct(self.config.loss_lvr_fct)
+    lvr_loss_fct = set_lvr_loss_fct(getattr(self.config, 'loss_lvr_fct', 'mse'))
 
     loss = None
     loss_ce = None
@@ -595,7 +1246,7 @@ def qwen2_5_mixed_modality_forward_lvr_inference(
     last_position_hidden_state = outputs.last_hidden_state[:,-1,:]
     logits = self.lm_head(hidden_states)
 
-    lvr_loss_fct = set_lvr_loss_fct(self.config.loss_lvr_fct)
+    lvr_loss_fct = set_lvr_loss_fct(getattr(self.config, 'loss_lvr_fct', 'mse'))
 
     loss = None
     loss_ce = None
@@ -846,7 +1497,7 @@ def qwen2_5_mixed_modality_forward_lvr_with_head(
     last_position_hidden_state = outputs.last_hidden_state[:,-1,:]
     logits = self.lm_head(hidden_states)
 
-    lvr_loss_fct = set_lvr_loss_fct(self.config.loss_lvr_fct)
+    lvr_loss_fct = set_lvr_loss_fct(getattr(self.config, 'loss_lvr_fct', 'mse'))
 
     loss = None
     loss_ce = None
@@ -1101,7 +1752,7 @@ def qwen2_5_mixed_modality_forward_lvr_with_head_inference(
     last_position_hidden_state = outputs.last_hidden_state[:,-1,:]
     logits = self.lm_head(hidden_states)
 
-    lvr_loss_fct = set_lvr_loss_fct(self.config.loss_lvr_fct)
+    lvr_loss_fct = set_lvr_loss_fct(getattr(self.config, 'loss_lvr_fct', 'mse'))
 
     loss = None
     loss_ce = None
@@ -1342,7 +1993,7 @@ def qwen2_5_mixed_modality_forward_lvr_with_head_with_modeSwitchLoss(
     last_position_hidden_state = outputs.last_hidden_state[:,-1,:]
     logits = self.lm_head(hidden_states)
 
-    lvr_loss_fct = set_lvr_loss_fct(self.config.loss_lvr_fct)
+    lvr_loss_fct = set_lvr_loss_fct(getattr(self.config, 'loss_lvr_fct', 'mse'))
 
     loss = None
     loss_ce = None
@@ -1615,8 +2266,8 @@ def qwen2_5_mixed_modality_forward_lvr_with_head_with_latentEndToken(
     last_position_hidden_state = outputs.last_hidden_state[:,-1,:]
     logits = self.lm_head(hidden_states)
 
-    lvr_loss_fct = set_lvr_loss_fct(self.config.loss_lvr_fct)
-    mode_switch_loss_fct = set_lvr_loss_fct(self.config.loss_mode_switch_fct)
+    lvr_loss_fct = set_lvr_loss_fct(getattr(self.config, 'loss_lvr_fct', 'mse'))
+    mode_switch_loss_fct = set_lvr_loss_fct(getattr(self.config, 'loss_mode_switch_fct', 'bce'))
 
     loss = None
     loss_ce = None
@@ -1861,8 +2512,8 @@ def qwen2_5_mixed_modality_forward_lvr_with_latentEndToken(
     last_position_hidden_state = outputs.last_hidden_state[:,-1,:]
     logits = self.lm_head(hidden_states)
 
-    lvr_loss_fct = set_lvr_loss_fct(self.config.loss_lvr_fct)
-    mode_switch_loss_fct = set_lvr_loss_fct(self.config.loss_mode_switch_fct)
+    lvr_loss_fct = set_lvr_loss_fct(getattr(self.config, 'loss_lvr_fct', 'mse'))
+    mode_switch_loss_fct = set_lvr_loss_fct(getattr(self.config, 'loss_mode_switch_fct', 'bce'))
 
     loss = None
     loss_ce = None
@@ -2278,7 +2929,7 @@ def qwen2_5_mixed_modality_forward_lvr_rl(
 
 #     hidden_states = outputs[0]
 
-#     lvr_loss_fct = set_lvr_loss_fct(self.config.loss_lvr_fct)
+#     lvr_loss_fct = set_lvr_loss_fct(getattr(self.config, 'loss_lvr_fct', 'mse'))
 
 
 #     loss = None

@@ -51,28 +51,88 @@ from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.integrations.fsdp import is_fsdp_managed_module
 
 
-from src.model.lvr_heads import LVRHead, LVRHeadGLU
+from src.model.lvr_heads import LVRHead, LVRHeadGLU, PrototypeBank, PrototypeCrossAttention
+from src.config.prototype_lvr_config import PrototypeLVRConfig
+from src.model.latent_reasoning_module import LatentReasoningModule, ROIPooler, compute_imputation_loss
+from src.config.latent_reasoning_config import LatentReasoningConfig
 
 class QwenWithLVR(Qwen2_5_VLForConditionalGeneration):
     def __init__(self, config):
         super().__init__(config)
-        if config.lvr_head:
+        if getattr(config, "lvr_head", False):
             self._init_lvr_head(config.lvr_head_type)
-        if config.latent_end_token:
+        if getattr(config, "latent_end_token", False):
             self._init_lvr_latent_end_emb()
+
+        # Prototype-based parallel LVR modules (optional, activated if prototype_config set)
+        self.prototype_bank = None
+        self.prototype_cross_attn = None
+        self._last_proto_attn_weights = None  # [B, K, N_obs]
+        self._last_proto_Z = None             # [B, K, D]
+        self.proto_token_ids = None
+        if hasattr(config, 'prototype_config') and config.prototype_config is not None:
+            self._init_prototype_modules(config.prototype_config)
+
+        # DIMV-style latent reasoning module (optional, activated if latent_reasoning_config set)
+        self.latent_reasoning = None
+        self._last_slot_attn_weights = None   # [B, T_v, N_obs] — for monitoring
+        self.slot_token_ids = None            # list of T_v token IDs, set by setup_slot_tokens()
+        self.T_v = None
+        # DIMV-ROI: ROI pooler + stored tensors for L_IMP
+        self.roi_pooler = None
+        self._last_Z_final = None
+        self._last_Z_roi_target = None
+        if hasattr(config, 'latent_reasoning_config') and config.latent_reasoning_config is not None:
+            self._init_latent_reasoning(config.latent_reasoning_config)
 
     def _get_initial_cache_position(self, *args):
         """
-        Compatibility shim for older custom generation code.
+        Compatibility shim that sets cache_position in model_kwargs.
 
-        Newer `transformers` versions removed `_get_initial_cache_position`.
-        For this repo's decoding loops, returning `model_kwargs` unchanged is
-        sufficient because generation already works without explicit
-        `cache_position` management on current Qwen2.5-VL codepaths.
+        Supports both call signatures used across different transformers versions:
+          New (4.x+): (seq_length: int, device: torch.device, model_kwargs: dict)
+          Old:        (input_ids: Tensor, model_kwargs: dict)
         """
         if not args:
             return {}
         model_kwargs = args[-1]
+
+        # Already set — nothing to do
+        if model_kwargs.get("cache_position") is not None:
+            return model_kwargs
+
+        # Resolve seq_length and device from args
+        if len(args) >= 3:
+            # New signature: (seq_length, device, model_kwargs)
+            seq_length = args[0]
+            device = args[1]
+            if isinstance(seq_length, torch.Tensor):
+                # Caller passed input_ids tensor as first arg despite 3-arg form
+                device = seq_length.device
+                seq_length = seq_length.shape[-1]
+        elif len(args) >= 2:
+            # Old signature: (input_ids, model_kwargs)
+            input_ids_arg = args[0]
+            device = input_ids_arg.device
+            seq_length = input_ids_arg.shape[-1]
+        else:
+            return model_kwargs
+
+        cache_position = torch.arange(int(seq_length), dtype=torch.int64, device=device)
+
+        # Shift by past length if a cache already exists
+        past_key_values = model_kwargs.get("past_key_values")
+        if past_key_values is not None:
+            from transformers.cache_utils import Cache
+            if not isinstance(past_key_values, Cache):
+                past_length = past_key_values[0][0].shape[2]
+            elif hasattr(past_key_values, "get_seq_length") and past_key_values.get_seq_length() is not None:
+                past_length = past_key_values.get_seq_length()
+            else:
+                past_length = 0
+            cache_position = cache_position[past_length:]
+
+        model_kwargs["cache_position"] = cache_position
         return model_kwargs
         
     def _resolve_hidden_size(self) -> int:
@@ -142,6 +202,124 @@ class QwenWithLVR(Qwen2_5_VLForConditionalGeneration):
         # )
         # self.register_buffer('lvr_latent_end_emb', lvr_latent_end_emb)    # will not compute grad
     
+    def _init_prototype_modules(self, proto_cfg: PrototypeLVRConfig):
+        """Initialise PrototypeBank and PrototypeCrossAttention from a PrototypeLVRConfig."""
+        D = self._resolve_hidden_size()
+
+        self.prototype_bank = PrototypeBank(
+            K=proto_cfg.num_prototypes,
+            D=D,
+            init_scale=proto_cfg.prototype_init_scale,
+        )
+
+        self.prototype_cross_attn = PrototypeCrossAttention(
+            D=D,
+            num_heads=proto_cfg.prototype_num_heads,
+            dropout=proto_cfg.prototype_dropout,
+        )
+
+        print(f"Activated prototype LVR: K={proto_cfg.num_prototypes}, "
+              f"D={D}, heads={proto_cfg.prototype_num_heads}")
+        print(f"  PrototypeBank params: {proto_cfg.num_prototypes * D:,}")
+        print(f"  PrototypeCrossAttn params: "
+              f"{sum(p.numel() for p in self.prototype_cross_attn.parameters()):,}")
+
+    def setup_proto_tokens(self, tokenizer):
+        """
+        Add [proto_0]...[proto_{K-1}] to the tokenizer vocabulary and register
+        their token IDs. Called after model and tokenizer are both loaded.
+
+        These placeholder tokens get replaced with actual prototype embeddings Z
+        in the forward pass — exactly like [lvr] tokens are replaced with visual
+        embeddings in the original LVR.
+        """
+        if self.prototype_bank is None:
+            raise RuntimeError("setup_proto_tokens called but prototype_bank is not initialised. "
+                               "Set config.prototype_config before calling this.")
+        K = self.prototype_bank.K
+        proto_tokens = [f"[proto_{k}]" for k in range(K)]
+        tokenizer.add_special_tokens({"additional_special_tokens": proto_tokens})
+        self.resize_token_embeddings(len(tokenizer))
+
+        self.proto_token_ids = [
+            tokenizer.convert_tokens_to_ids(f"[proto_{k}]") for k in range(K)
+        ]
+        print(f"Registered proto token IDs: {self.proto_token_ids}")
+
+    # ── DIMV latent reasoning ─────────────────────────────────────────────
+
+    def _init_latent_reasoning(self, lr_cfg):
+        """
+        Initialise LatentReasoningModule.
+
+        lr_cfg may be:
+          - a LatentReasoningConfig dataclass  (set at training time)
+          - a plain dict                       (round-tripped via config.json by transformers)
+        """
+        if isinstance(lr_cfg, dict):
+            lr_cfg = LatentReasoningConfig(**lr_cfg)
+        d = self._resolve_hidden_size()
+        self.latent_reasoning = LatentReasoningModule(
+            d=d,
+            T_v=lr_cfg.num_reasoning_slots,
+            L=lr_cfg.num_refinement_steps,
+            num_heads=lr_cfg.num_attn_heads,
+            dropout=lr_cfg.dropout,
+            use_layer_norm=lr_cfg.use_layer_norm,
+            use_ffn=lr_cfg.use_ffn,
+            slot_init=lr_cfg.slot_init,
+        )
+        self.T_v = lr_cfg.num_reasoning_slots
+        n_params = sum(p.numel() for p in self.latent_reasoning.parameters())
+        print(
+            f"[LatentReasoning] T_v={lr_cfg.num_reasoning_slots}, "
+            f"L={lr_cfg.num_refinement_steps}, init={lr_cfg.slot_init}, "
+            f"params={n_params:,}"
+        )
+
+        # ── DIMV-ROI: init ROIPooler if use_roi_supervision ──────────────
+        if getattr(lr_cfg, 'use_roi_supervision', False):
+            d = self._resolve_hidden_size()
+            self.roi_pooler = ROIPooler(
+                d=d,
+                T_v=lr_cfg.num_reasoning_slots,
+                method=getattr(lr_cfg, 'roi_pool_method', 'attention_pool'),
+                num_heads=lr_cfg.num_attn_heads,
+            )
+            roi_params = sum(p.numel() for p in self.roi_pooler.parameters())
+            print(
+                f"[DIMV-ROI] ROIPooler method={lr_cfg.roi_pool_method}, "
+                f"T_v={lr_cfg.num_reasoning_slots}, "
+                f"λ={lr_cfg.imputation_loss_lambda}, params={roi_params:,}"
+            )
+
+    def setup_slot_tokens(self, tokenizer) -> None:
+        """
+        Add T_v slot tokens [SLOT_0]..[SLOT_{T_v-1}] to the tokenizer and
+        register their IDs on the model. Call this AFTER both model and
+        tokenizer are loaded, BEFORE creating the dataset or running training.
+
+        The slot tokens are placeholder IDs in input_ids. During the forward
+        pass their embeddings in inputs_embeds are replaced by Z^(final)
+        computed by LatentReasoningModule.
+        """
+        if self.latent_reasoning is None:
+            raise RuntimeError(
+                "setup_slot_tokens called but latent_reasoning is not initialised. "
+                "Set config.latent_reasoning_config before calling this."
+            )
+        T_v = self.T_v
+        slot_tokens = [f"[SLOT_{k}]" for k in range(T_v)]
+        num_added = tokenizer.add_special_tokens({"additional_special_tokens": slot_tokens})
+        self.resize_token_embeddings(len(tokenizer))
+        self.slot_token_ids = [
+            tokenizer.convert_tokens_to_ids(f"[SLOT_{k}]") for k in range(T_v)
+        ]
+        print(
+            f"[LatentReasoning] Added {num_added} slot tokens. "
+            f"IDs: {self.slot_token_ids[0]}...{self.slot_token_ids[-1]}"
+        )
+
     # Patch the generation function with lvr_generate
     def generate(
         self,
@@ -297,9 +475,8 @@ class QwenWithLVR(Qwen2_5_VLForConditionalGeneration):
             and not self.config.is_encoder_decoder
         ):
             max_cache_length += inputs_tensor.shape[1]
-        generation_mode = generation_config.get_generation_mode(assistant_model)
         self._prepare_cache_for_generation(
-            generation_config, model_kwargs, generation_mode, batch_size, max_cache_length
+            generation_config, model_kwargs, assistant_model, batch_size, max_cache_length, device
         )
 
         # 8. determine generation mode
