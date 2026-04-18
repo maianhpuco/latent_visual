@@ -1,5 +1,9 @@
 from .lvr_sft_dataset import make_supervised_data_module_lvr
-from .lvr_sft_dataset_packed import make_packed_supervised_data_module_lvr, make_packed_supervised_data_module_dimv
+from .lvr_sft_dataset_packed import (
+    make_packed_supervised_data_module_lvr,
+    make_packed_supervised_data_module_dimv,
+    make_packed_supervised_data_module_dimv_roi,
+)
 
 try:
     from .lvr_sft_dataset_packed_fixedToken import make_packed_supervised_data_module_lvr_fixedToken
@@ -26,4 +30,5 @@ __all__ = [
     "make_packed_supervised_data_module_lvr",
     "make_packed_supervised_data_module_lvr_fixedToken",
     "make_packed_supervised_data_module_dimv",
+    "make_packed_supervised_data_module_dimv_roi",
 ]

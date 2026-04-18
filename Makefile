@@ -244,6 +244,13 @@ train-stage1-3b-dimv:
 	bash scripts/finetune_lvr_stage1_3b_dimv_full_simea.sh 2>&1 | tee logs/finetune_lvr_stage1_3b_dimv.log
 	@echo "[train-stage1-3b-dimv] done"
 
+## Stage-1 DIMV-ROI latent reasoning (3B, full FT, 4 GPUs) — NTP + imputation loss
+## Logs to logs/finetune_lvr_stage1_3b_dimv_roi.log
+train-stage1-3b-dimv-roi:
+	mkdir -p logs
+	bash scripts/finetune_lvr_stage1_3b_dimv_roi_simea.sh 2>&1 | tee logs/finetune_lvr_stage1_3b_dimv_roi.log
+	@echo "[train-stage1-3b-dimv-roi] done"
+
 ## Stage-1 DIMV latent reasoning (3B + LoRA) — same but with LoRA r=64 on LLM
 train-stage1-3b-dimv-lora:
 	mkdir -p logs
@@ -254,7 +261,7 @@ train-stage1-3b-dimv-lora:
 train-stage2:
 	bash scripts/finetune_lvr_stage2_7b.sh
 
-.PHONY: infer-hf infer-ckpt1000 eval-vstar eval-vstar-stage1-3b-ckpt1000 eval-vstar-stage1-3b-dimv eval-mmvp-stage1-3b-dimv eval-all-dimv eval-blink eval-mmvp eval-all eval-vstar-lora eval-blink-lora eval-mmvp-lora eval-all-lora train-stage1 train-stage1-3b train-stage1-3b-1gpu train-stage1-3b-lora train-stage1-3b-lora-zero2 train-stage1-3b-nowandb train-stage1-3b-lvrhead-nowandb train-stage1-3b-prototype train-stage1-3b-prototype-full train-stage1-3b-dimv train-stage1-3b-dimv-lora train-stage2 monitor-gpu
+.PHONY: infer-hf infer-ckpt1000 eval-vstar eval-vstar-stage1-3b-ckpt1000 eval-vstar-stage1-3b-dimv eval-mmvp-stage1-3b-dimv eval-all-dimv eval-blink eval-mmvp eval-all eval-vstar-lora eval-blink-lora eval-mmvp-lora eval-all-lora train-stage1 train-stage1-3b train-stage1-3b-1gpu train-stage1-3b-lora train-stage1-3b-lora-zero2 train-stage1-3b-nowandb train-stage1-3b-lvrhead-nowandb train-stage1-3b-prototype train-stage1-3b-prototype-full train-stage1-3b-dimv train-stage1-3b-dimv-roi train-stage1-3b-dimv-lora train-stage2 monitor-gpu
 
 
 # # Single image

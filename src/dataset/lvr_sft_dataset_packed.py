@@ -1489,3 +1489,335 @@ class PackedDataCollatorForSupervisedDatasetDIMV(object):
             data_dict["image_grid_thw"] = torch.cat(all_image_grid_thw)
 
         return data_dict
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DIMV-ROI: adds bbox → ROI token supervision on top of DIMV
+# ─────────────────────────────────────────────────────────────────────────────
+
+class IterableSupervisedDatasetDIMVROI(IterableSupervisedDatasetDIMV):
+    """
+    DIMV dataset variant that also extracts ROI patch indices from bboxes.
+
+    Each sample includes `lvr_tokens`: a 1-D LongTensor of flat patch indices
+    covering all annotated bounding boxes.  The ROI pooler in the forward pass
+    will gather those visual tokens to produce the imputation target Ẑ_ROI.
+
+    If a sample has no 'bboxes' key (or an empty list), lvr_tokens is an
+    empty tensor and that sample contributes no imputation loss.
+    """
+
+    def bbox_to_token_idxs(self, bboxes, image_grid_thw):
+        """Map bounding boxes to flat patch indices in the Qwen-VL 2× downsampled grid."""
+        _, h, w = image_grid_thw[0].tolist()
+        token_idxs = []
+        for bbox in bboxes:
+            x0, y0, x1, y1 = bbox
+            x0_grid = max(0, min(int(np.floor(x0 * w)), w - 1))
+            x1_grid = max(0, min(int(np.ceil(x1 * w)), w))
+            y0_grid = max(0, min(int(np.floor(y0 * h)), h - 1))
+            y1_grid = max(0, min(int(np.ceil(y1 * h)), h))
+            x0_token = x0_grid // 2
+            x1_token = (x1_grid + 1) // 2
+            y0_token = y0_grid // 2
+            y1_token = (y1_grid + 1) // 2
+            H2, W2 = h // 2, w // 2
+            idxs = [
+                int(yy * W2 + xx)
+                for yy in range(y0_token, y1_token)
+                for xx in range(x0_token, x1_token)
+            ]
+            token_idxs.append(idxs)
+        return token_idxs
+
+    def __iter__(self):
+        self._enable_worker_distributed()
+        start_idx = 0
+        if self.worker_state_key is None:
+            self.worker_state_key = f"work_state_{self.worker_id}"
+        if (
+            self.worker_state_key in self._state_dict
+            and len(self._state_dict[self.worker_state_key]) > 0
+        ):
+            start_idx = self._state_dict[self.worker_state_key]["current_idx"]
+            self._state_dict.pop(self.worker_state_key)
+
+        if self.worker_id == 0:
+            logger.info(
+                f"[{self.ds_name}] [Worker {self.worker_id}] DIMV-ROI iter start_idx={start_idx}"
+            )
+
+        for i in range(start_idx, len(self.raw_data)):
+            sources = self.raw_data[i]
+
+            # ── image loading ───────────────────────────────────────────────
+            try:
+                processor = self.processor
+                videos = None
+                grid_key = "image_grid_thw"
+                pixel_key = "pixel_values"
+
+                image_files = sources["image"]
+                image_folder = self.image_folder
+                if isinstance(image_files, str):
+                    image_files = [image_files]
+
+                images = []
+                for image_file in image_files:
+                    if not os.path.exists(image_file):
+                        if not image_file.startswith("http"):
+                            full_path = os.path.join(image_folder, image_file)
+                            if not os.path.exists(full_path):
+                                parts = image_file.split(os.sep, 1)
+                                if len(parts) > 1:
+                                    full_path = os.path.join(image_folder, parts[1])
+                            image_file = full_path
+                    images.append(
+                        get_image_info(
+                            image_file,
+                            self.image_min_pixel,
+                            self.image_max_pixel,
+                            self.image_resized_w,
+                            self.image_resized_h,
+                        )
+                    )
+            except (FileNotFoundError, OSError) as _img_err:
+                logger.warning(f"[DIMV-ROI] [{self.ds_name}] Skipping sample {i}: {_img_err}")
+                continue
+            # ────────────────────────────────────────────────────────────────
+
+            conv = copy.deepcopy(llava_to_openai(sources["conversations"], is_video=False))
+
+            all_input_ids = []
+            all_labels = []
+            all_pixel_values = []
+            all_image_grid_thw = []
+            image_grid_thw_for_roi = None  # captured from first image turn
+
+            # System message
+            if len(SYSTEM_MESSAGE) > 0:
+                system_message = (
+                    f"{DEFAULT_IM_START_TOKEN}system\n{SYSTEM_MESSAGE}{DEFAULT_IM_END_TOKEN}\n"
+                )
+                system_input_ids = processor.tokenizer(
+                    system_message, add_special_tokens=False, return_tensors="pt"
+                )["input_ids"]
+                system_labels = torch.full_like(system_input_ids, IGNORE_INDEX)
+                all_input_ids.append(system_input_ids.squeeze(0))
+                all_labels.append(system_labels.squeeze(0))
+
+            for j in range(0, len(conv), 2):
+                user_turn = conv[j]
+                gpt_turn = conv[j + 1]
+
+                user_text = (
+                    f"{DEFAULT_IM_START_TOKEN}{user_turn['role']}\n"
+                    f"{user_turn['content']}"
+                    f"{DEFAULT_IM_END_TOKEN}\n"
+                    f"{DEFAULT_IM_START_TOKEN}{gpt_turn['role']}\n"
+                )
+                response_text = f"{gpt_turn['content']}{DEFAULT_IM_END_TOKEN}\n"
+
+                if DEFAULT_IMAGE_TOKEN in user_text:
+                    inputs = processor(
+                        text=[user_text],
+                        images=images,
+                        videos=videos,
+                        padding=False,
+                        do_resize=False,
+                        return_tensors="pt",
+                    )
+                    prompt_input_ids = inputs["input_ids"]
+                    all_pixel_values.append(inputs[pixel_key])
+                    thw = inputs[grid_key]
+                    all_image_grid_thw.append(thw)
+                    if image_grid_thw_for_roi is None:
+                        image_grid_thw_for_roi = thw
+                else:
+                    prompt_input_ids = processor.tokenizer(
+                        user_text,
+                        add_special_tokens=False,
+                        padding=False,
+                        return_tensors="pt",
+                    )["input_ids"]
+
+                response_input_ids = processor.tokenizer(
+                    response_text,
+                    add_special_tokens=False,
+                    padding=False,
+                    return_tensors="pt",
+                )["input_ids"]
+
+                slot_ids = self.slot_ids_tensor
+                prompt_ids_1d = prompt_input_ids.squeeze(0)
+                response_ids_1d = response_input_ids.squeeze(0)
+
+                input_ids = torch.cat([prompt_ids_1d, slot_ids, response_ids_1d], dim=0)
+
+                T_v = slot_ids.size(0)
+                labels = torch.cat(
+                    [
+                        torch.full((len(prompt_ids_1d),), IGNORE_INDEX, dtype=torch.long),
+                        torch.full((T_v,), IGNORE_INDEX, dtype=torch.long),
+                        response_ids_1d,
+                    ],
+                    dim=0,
+                )
+
+                all_input_ids.append(input_ids)
+                all_labels.append(labels)
+
+            input_ids = torch.cat(all_input_ids, dim=0).to(torch.long)
+            labels = torch.cat(all_labels, dim=0).to(torch.long)
+            attention_mask = (input_ids > -1_000_000).to(torch.long)
+
+            # ── ROI token indices from bboxes ──────────────────────────────
+            bboxes = sources.get("bboxes", [])
+            if bboxes and image_grid_thw_for_roi is not None:
+                idx_groups = self.bbox_to_token_idxs(bboxes, image_grid_thw_for_roi)
+                all_idxs = []
+                for g in idx_groups:
+                    all_idxs.extend(g)
+                lvr_tokens_tensor = torch.tensor(all_idxs, dtype=torch.long)
+            else:
+                lvr_tokens_tensor = torch.tensor([], dtype=torch.long)
+            # ──────────────────────────────────────────────────────────────
+
+            data_dict = dict(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                lvr_tokens=[lvr_tokens_tensor],  # list of 1 tensor; PackedDataset concat via +
+            )
+
+            if all_pixel_values:
+                data_dict[pixel_key] = torch.cat(all_pixel_values, dim=0)
+                data_dict[grid_key] = torch.cat(all_image_grid_thw, dim=0)
+
+            data_dict["input_lengths"] = torch.tensor([input_ids.size(0)])
+
+            yield data_dict
+
+
+class PackedDataCollatorForSupervisedDatasetDIMVROI(object):
+    """
+    Collator for DIMV-ROI packed batches.
+
+    Like PackedDataCollatorForSupervisedDatasetDIMV, but passes `lvr_tokens`
+    through as a list of LongTensors (one per sample in the micro-batch) so
+    the monkey-patched forward can use them to extract V_ROI* embeddings.
+    """
+
+    def __init__(self, pad_token_id: int):
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, features):
+        if not isinstance(features, list):
+            features = [features]
+
+        all_input_ids = []
+        all_attention_masks = []
+        all_labels = []
+        all_pixel_values = []
+        all_image_grid_thw = []
+        all_lvr_tokens = []  # list of tensors, one per sample
+
+        for feature in features:
+            lengths = feature["input_lengths"].tolist()
+            all_input_ids.extend(torch.split(feature["input_ids"], lengths))
+            all_attention_masks.extend(torch.split(feature["attention_mask"], lengths))
+            all_labels.extend(torch.split(feature["labels"], lengths))
+
+            if "pixel_values" in feature:
+                all_pixel_values.append(feature["pixel_values"])
+                all_image_grid_thw.append(feature["image_grid_thw"])
+
+            # lvr_tokens is a list of tensors accumulated by PackedDataset
+            for tok in feature.get("lvr_tokens", []):
+                all_lvr_tokens.append(tok)
+
+        # Pad sequences to uniform length
+        max_len = max(len(seq) for seq in all_input_ids)
+        padded_input_ids, padded_masks, padded_labels = [], [], []
+        for ids, mask, lbl in zip(all_input_ids, all_attention_masks, all_labels):
+            pad = max_len - len(ids)
+            padded_input_ids.append(
+                torch.nn.functional.pad(ids, (0, pad), value=self.pad_token_id)
+            )
+            padded_masks.append(torch.nn.functional.pad(mask, (0, pad), value=0))
+            padded_labels.append(
+                torch.nn.functional.pad(lbl, (0, pad), value=IGNORE_INDEX)
+            )
+
+        data_dict = {
+            "input_ids": torch.stack(padded_input_ids),
+            "attention_mask": torch.stack(padded_masks),
+            "labels": torch.stack(padded_labels),
+            "lvr_tokens": all_lvr_tokens,  # list[Tensor], passed to forward
+        }
+
+        if all_pixel_values:
+            data_dict["pixel_values"] = torch.cat(all_pixel_values)
+            data_dict["image_grid_thw"] = torch.cat(all_image_grid_thw)
+
+        return data_dict
+
+
+def make_packed_supervised_data_module_dimv_roi(
+    model_id,
+    processor,
+    data_args,
+    training_args,
+    slot_token_ids: list,
+):
+    """
+    Build PackedDataset + collator for DIMV-ROI training.
+
+    Identical to make_packed_supervised_data_module_dimv except:
+    - Uses IterableSupervisedDatasetDIMVROI (reads bboxes → lvr_tokens).
+    - Uses PackedDataCollatorForSupervisedDatasetDIMVROI (passes lvr_tokens through).
+    """
+    data_rank = dist.get_rank()
+    data_world_size = dist.get_world_size()
+
+    meta_data = json.load(open(data_args.data_path))
+
+    datasets = []
+    total_data_len = 0
+    for meta in meta_data:
+        iterable_ds = IterableSupervisedDatasetDIMVROI(
+            data_path=meta["data_path"],
+            image_folder=meta["image_folder"],
+            ds_name=meta["ds_name"],
+            processor=processor,
+            data_args=data_args,
+            model_id=model_id,
+            slot_token_ids=slot_token_ids,
+            data_rank=data_rank,
+            data_world_size=data_world_size,
+            distributed_mode=training_args.enable_data_packing,
+            random_seed=data_args.random_seed,
+        )
+        datasets.append(iterable_ds)
+        total_data_len += len(iterable_ds)
+
+    packed_train_dataset = PackedDataset(
+        tokenizer=processor.tokenizer,
+        datasets=datasets,
+        data_rank=data_rank,
+        data_world_size=data_world_size,
+        max_packed_tokens=training_args.max_packed_tokens,
+        max_buffer_size=100,
+        long_seq_threshold=training_args.long_seq_threshold,
+        max_instance_per_batch=training_args.max_instance_per_batch,
+    )
+
+    data_collator = PackedDataCollatorForSupervisedDatasetDIMVROI(
+        pad_token_id=processor.tokenizer.pad_token_id
+    )
+
+    return dict(
+        train_dataset=packed_train_dataset,
+        eval_dataset=None,
+        data_collator=data_collator,
+    ), total_data_len

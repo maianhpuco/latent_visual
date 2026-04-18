@@ -692,35 +692,66 @@ def qwen2_5_mixed_modality_forward_dimv(
     )
 
     hidden_states = outputs[0]
-    logits = self.lm_head(hidden_states)
 
     # ── NTP loss on answer tokens only ────────────────────────────────────
     # labels: IGNORE_INDEX for x_txt + V + Z positions, real IDs for Y.
     # Slot tokens must also be masked in labels (they are by the dataset).
+    #
+    # Chunked cross-entropy: compute lm_head + CE in slices of the sequence
+    # so peak memory is (chunk_size × vocab) instead of (full_seq × vocab).
+    # At seq=16384 and vocab=152k, the full logits tensor is ~4.7 GB bf16 —
+    # chunking keeps it to ~150 MB per chunk (chunk_size=128).
     loss_ntp = None
+    logits = None  # not returned to caller; saves ~4.7 GB allocation
+
     if labels is not None:
-        logits_f = logits.float()
-        shift_logits = logits_f[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
+        shift_hidden = hidden_states[..., :-1, :].contiguous()   # [B, S-1, d]
+        shift_labels = labels[..., 1:].contiguous()               # [B, S-1]
 
         # Extra guard: mask out any slot token IDs that leaked into labels
         if self.slot_token_ids is not None:
             for sid in self.slot_token_ids:
                 shift_labels = shift_labels.masked_fill(shift_labels == sid, IGNORE_INDEX)
 
-        loss_fct = CrossEntropyLoss()
-        loss_ntp = loss_fct(
-            shift_logits.view(-1, shift_logits.shape[-1]),
-            shift_labels.view(-1).to(shift_logits.device),
-        )
+        B, S, d = shift_hidden.shape
+        flat_hidden = shift_hidden.view(B * S, d)
+        flat_labels = shift_labels.view(B * S).to(flat_hidden.device)
+
+        # Only compute CE over positions that have a real label (not IGNORE_INDEX).
+        # This avoids running lm_head on the ~90% of tokens that are masked.
+        active = flat_labels != IGNORE_INDEX
+        if active.any():
+            active_hidden = flat_hidden[active]   # [N_active, d]
+            active_labels = flat_labels[active]   # [N_active]
+
+            CHUNK = 512
+            loss_fct = CrossEntropyLoss()
+            total_loss = torch.tensor(0.0, device=flat_hidden.device, dtype=torch.float32)
+            n_chunks = 0
+            for start in range(0, active_hidden.shape[0], CHUNK):
+                chunk_h = active_hidden[start:start + CHUNK]          # [C, d]
+                chunk_l = active_labels[start:start + CHUNK]          # [C]
+                chunk_logits = self.lm_head(chunk_h)                  # [C, vocab]
+                total_loss = total_loss + loss_fct(chunk_logits, chunk_l)
+                n_chunks += 1
+                del chunk_logits
+            loss_ntp = total_loss / n_chunks
+        else:
+            # Batch has no active labels (all masked) — zero loss, still touch lm_head
+            # so DeepSpeed ZeRO-3 doesn't complain about unused parameters.
+            dummy = self.lm_head(flat_hidden[:1])
+            loss_ntp = dummy.sum() * 0.0
+    else:
+        # No labels — materialise logits for generation/eval
+        logits = self.lm_head(hidden_states)
 
     if not return_dict:
         out = (logits,) + outputs[1:]
         return (loss_ntp,) + out if loss_ntp is not None else out
 
     return Qwen2_5_VLCausalLMOutputWithPast(
-        loss_ce=loss_ntp,       # NTP loss — only this is used by the trainer
-        loss_lvr=None,          # no auxiliary loss in DIMV
+        loss_ce=loss_ntp,
+        loss_lvr=None,
         loss_mode_switch=None,
         logits=logits,
         past_key_values=outputs.past_key_values,

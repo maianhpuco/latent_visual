@@ -120,6 +120,28 @@ class TrainingArguments(HFTrainingArguments):
         metadata={"help": "Maximum answer length for DIMV V* validation generation."},
     )
 
+    # DIMV-ROI: imputation supervision
+    use_roi_supervision: bool = field(
+        default=False,
+        metadata={"help": "Add L_IMP loss supervising Z^(final) to match pooled ROI visual tokens."},
+    )
+    roi_pool_method: str = field(
+        default="attention_pool",
+        metadata={"help": "ROI pooling method: attention_pool | adaptive_pool | avg_pool."},
+    )
+    imputation_loss_type: str = field(
+        default="cosine",
+        metadata={"help": "Distance metric for L_IMP: cosine | mse | nce."},
+    )
+    imputation_loss_lambda: float = field(
+        default=0.1,
+        metadata={"help": "λ weight for L_IMP in L = L_NTP + λ * L_IMP."},
+    )
+    nce_temperature: float = field(
+        default=0.07,
+        metadata={"help": "Temperature τ for NCE imputation loss."},
+    )
+
     mode_switch_loss: Optional[bool] = False
     loss_mode_switch_fct: Optional[str] = field(default="mse")
     loss_mode_switch_lambda: Optional[float] = field(default=1e-1)
