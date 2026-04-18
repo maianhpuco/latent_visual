@@ -1,0 +1,12 @@
+name: /home/mvu9/conda_envs/latent_visual
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - python=3.11
+  - cuda-nvcc
+  - cuda-toolkit
+prefix: /home/mvu9/conda_envs/latent_visual
